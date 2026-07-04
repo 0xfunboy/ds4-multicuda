@@ -221,6 +221,135 @@ static cudaEvent_t g_stream_selected_stage_event[4];
 static uint64_t g_stream_selected_stage_bytes;
 static cudaStream_t g_stream_selected_upload_stream;
 
+/* =========================================================================
+ * Native multi-GPU expert split.
+ * =========================================================================
+ *
+ * The graph (attention, KV, router, shared experts, dense projections) always
+ * runs on one primary device.  Secondary devices hold a static "expert bank":
+ * as many routed-expert weight triples (gate/up/down) as their VRAM allows,
+ * loaded once at startup and never evicted or re-streamed at decode time.
+ * This matches asymmetric PCIe topologies (the primary keeps the fast link
+ * and the existing streaming machinery; secondaries only ever receive KBs of
+ * activations per layer).
+ *
+ * Selected (token, expert) pairs are partitioned by bank ownership at the
+ * existing host-visible staging points.  Every device then runs the same
+ * routed-MoE launch over the full pair list with complementary router-weight
+ * masks: a pair contributes only on the device that owns its expert; on all
+ * other devices it has weight 0 and its id is remapped to a resident slot
+ * (the MoE kernels apply the router weight linearly post-swiglu and clamp
+ * negative ids, so a zero-weight pair contributes exactly nothing).  Partial
+ * outputs are gathered through pinned host memory and summed on the primary.
+ */
+#define DS4_CUDA_MAX_DEVICES 8
+#define DS4_CUDA_BANK_MAX_LAYERS 128
+
+enum {
+    DS4_CUDA_SPLIT_OFF = 0,
+    DS4_CUDA_SPLIT_EXPERTS = 1,
+};
+
+struct cuda_peer_bank {
+    int valid;
+    uint32_t capacity;
+    uint32_t count;
+    uint32_t n_total_expert;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    char *gate_ptr;   /* capacity * gate_expert_bytes, secondary device */
+    char *up_ptr;     /* capacity * gate_expert_bytes */
+    char *down_ptr;   /* capacity * down_expert_bytes */
+    std::vector<int32_t> slot_of; /* [layer * n_total_expert + expert] -> slot | -1 */
+};
+
+/* Small pinned staging ring used to fill secondary expert banks from the
+ * mmap'd model without registering the whole mapping. */
+struct cuda_pin_ring {
+    char *base;
+    uint64_t seg;
+    int nslots;
+    int next;
+    cudaEvent_t ev[8];
+    int ev_valid[8];
+};
+
+struct cuda_peer_device {
+    int cuda_id;
+    /* Default-flag streams: kernel launches on the secondary's legacy stream
+     * are implicitly ordered against them, which gives H2D -> compute -> D2H
+     * ordering without extra events on the secondary itself. */
+    cudaStream_t xfer_in;
+    cudaStream_t xfer_out;
+    cudaEvent_t ev_in;      /* recorded on xfer_in after activation H2D */
+    cudaEvent_t ev_out;     /* recorded on xfer_out after partial D2H */
+    cudaEvent_t ev_gather;  /* created on the primary: partial H2D done */
+    int pin_in_flight;      /* pinned bounce buffers still referenced */
+    /* MoE scratch, grown on demand (allocated on the secondary device). */
+    ds4_gpu_tensor gate, up, mid, down, out, xq, sel, w_raw, w;
+    void *tmp;
+    uint64_t tmp_bytes;
+    cuda_pin_ring ring;
+    cuda_peer_bank bank;
+};
+
+/* Per-layer ownership partition, produced at the host-visible staging points
+ * (begin_selected_load / prepare_selected_batch) and consumed by the next
+ * routed-MoE launch for the same layer and pair count. */
+struct cuda_moe_split_pending {
+    int valid;
+    uint32_t layer;
+    uint32_t n_pairs;
+    uint32_t primary_pairs;
+    uint32_t dev_pairs[DS4_CUDA_MAX_DEVICES];
+    std::vector<int32_t> dev_slots[DS4_CUDA_MAX_DEVICES];
+};
+
+/* Pre-resolved launch overrides for running the routed-MoE path on a
+ * secondary device against its expert bank. */
+struct routed_moe_ext {
+    const char *gate_w;
+    const char *up_w;
+    const char *down_w;
+    const int32_t *selected_ptr;   /* device ptr, already slot-remapped */
+    uint32_t sort_expert_count;    /* compact id domain (bank capacity) */
+    const void *xq;                /* pre-quantized activations (q8_K) */
+    int tmp_slot;                  /* per-device scratch allocator slot */
+};
+
+static cuda_peer_device g_peer[DS4_CUDA_MAX_DEVICES];
+static int g_peer_count;                /* secondary devices in use */
+static int g_cuda_primary_device;
+static int g_cuda_split_mode = DS4_CUDA_SPLIT_OFF;
+static int g_cuda_p2p_mode;             /* 0 auto, 1 on, -1 off */
+static uint64_t g_peer_bank_budget_bytes; /* per secondary, 0 = auto */
+static char g_cuda_devices_config[64];  /* CLI/env device list, "" = unset */
+static int g_cuda_multigpu_ready;
+static int g_cuda_multigpu_debug;
+static cuda_moe_split_pending g_moe_split_pending;
+/* Primary-side helpers for the split path. */
+static ds4_gpu_tensor g_moe_xq0;        /* persistent q8_K activations */
+static ds4_gpu_tensor g_moe_w0;         /* masked router weights */
+static ds4_gpu_tensor g_moe_part0;      /* gathered secondary partials */
+static cudaStream_t g_peer_primary_xfer; /* non-blocking, primary device */
+static cudaEvent_t g_peer_primary_ev;   /* activations staged to pinned */
+static cudaEvent_t g_peer_primary_add_ev; /* partial adds done (buffer reuse) */
+/* Pinned bounce buffers shared by all secondaries. */
+static void *g_peer_pin_xq;
+static uint64_t g_peer_pin_xq_bytes;
+static void *g_peer_pin_w;
+static uint64_t g_peer_pin_w_bytes;
+static void *g_peer_pin_sel;
+static uint64_t g_peer_pin_sel_bytes;
+static void *g_peer_pin_out;
+static uint64_t g_peer_pin_out_bytes;
+
+static int cuda_multigpu_active(void) {
+    return g_cuda_multigpu_ready &&
+           g_peer_count > 0 &&
+           g_cuda_split_mode == DS4_CUDA_SPLIT_EXPERTS;
+}
+
 static int cuda_ok(cudaError_t err, const char *what);
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
@@ -270,6 +399,36 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     g_cuda_tmp = ptr;
     g_cuda_tmp_bytes = bytes;
     return g_cuda_tmp;
+}
+
+/* Scratch pool selector for the routed-MoE launch: slot 0 is the primary
+ * device's shared pool above; slots 1..N are per-secondary pools so a launch
+ * running against an expert bank never frees or reuses primary scratch.  The
+ * matching device must be current when a secondary slot is (re)grown. */
+static void *g_cuda_tmp_peer[DS4_CUDA_MAX_DEVICES];
+static uint64_t g_cuda_tmp_peer_bytes[DS4_CUDA_MAX_DEVICES];
+
+static void *cuda_tmp_alloc_slot(int slot, uint64_t bytes, const char *what) {
+    if (slot <= 0) return cuda_tmp_alloc(bytes, what);
+    const int i = slot - 1;
+    if (i >= DS4_CUDA_MAX_DEVICES || bytes == 0) return NULL;
+    if (g_cuda_tmp_peer_bytes[i] >= bytes) return g_cuda_tmp_peer[i];
+    if (g_cuda_tmp_peer[i]) {
+        (void)cudaFree(g_cuda_tmp_peer[i]);
+        g_cuda_tmp_peer[i] = NULL;
+        g_cuda_tmp_peer_bytes[i] = 0;
+    }
+    void *ptr = NULL;
+    cudaError_t err = cudaMalloc(&ptr, (size_t)bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA peer temp alloc failed for %s (%.2f MiB): %s\n",
+                what ? what : "scratch", (double)bytes / 1048576.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    g_cuda_tmp_peer[i] = ptr;
+    g_cuda_tmp_peer_bytes[i] = bytes;
+    return g_cuda_tmp_peer[i];
 }
 
 static int cuda_attention_score_buffer_fits(uint32_t n_comp) {
@@ -2252,13 +2411,579 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
     return 0;
 }
 
+/* ------------------------------------------------------------------------
+ * Multi-GPU configuration, device contexts, and expert banks.
+ * ------------------------------------------------------------------------ */
+
+static int g_cuda_devices_configured;
+static int g_cuda_split_configured;
+static int g_cuda_p2p_configured;
+static int g_peer_bank_budget_configured;
+
+extern "C" void ds4_gpu_set_cuda_devices(const char *list) {
+    if (!list) return;
+    snprintf(g_cuda_devices_config, sizeof(g_cuda_devices_config), "%s", list);
+    g_cuda_devices_configured = 1;
+}
+
+extern "C" void ds4_gpu_set_cuda_split(const char *mode) {
+    if (!mode) return;
+    if (!strcmp(mode, "off")) g_cuda_split_mode = DS4_CUDA_SPLIT_OFF;
+    else g_cuda_split_mode = DS4_CUDA_SPLIT_EXPERTS; /* auto == experts */
+    g_cuda_split_configured = 1;
+}
+
+extern "C" void ds4_gpu_set_cuda_p2p(const char *mode) {
+    if (!mode) return;
+    if (!strcmp(mode, "on")) g_cuda_p2p_mode = 1;
+    else if (!strcmp(mode, "off")) g_cuda_p2p_mode = -1;
+    else g_cuda_p2p_mode = 0;
+    g_cuda_p2p_configured = 1;
+}
+
+extern "C" void ds4_gpu_set_cuda_expert_bank_gb(double gb) {
+    if (gb <= 0.0) return;
+    g_peer_bank_budget_bytes = (uint64_t)(gb * 1073741824.0);
+    g_peer_bank_budget_configured = 1;
+}
+
+static void cuda_multigpu_parse_env(void) {
+    if (!g_cuda_devices_configured) {
+        const char *env = getenv("DS4_CUDA_DEVICES");
+        if (env && env[0]) {
+            snprintf(g_cuda_devices_config, sizeof(g_cuda_devices_config), "%s", env);
+        }
+    }
+    if (!g_cuda_split_configured) {
+        const char *env = getenv("DS4_CUDA_SPLIT");
+        if (env && env[0]) ds4_gpu_set_cuda_split(env);
+        g_cuda_split_configured = 0;
+    }
+    if (!g_cuda_p2p_configured) {
+        const char *env = getenv("DS4_CUDA_P2P");
+        if (env && env[0]) ds4_gpu_set_cuda_p2p(env);
+        g_cuda_p2p_configured = 0;
+    }
+    if (!g_peer_bank_budget_configured) {
+        const char *env = getenv("DS4_CUDA_EXPERT_BANK_GB");
+        if (env && env[0]) {
+            char *end = NULL;
+            double v = strtod(env, &end);
+            if (end != env && v > 0.0) {
+                g_peer_bank_budget_bytes = (uint64_t)(v * 1073741824.0);
+            }
+        }
+    }
+    g_cuda_multigpu_debug = getenv("DS4_CUDA_MULTIGPU_DEBUG") != NULL;
+}
+
+/* Parse the configured device list ("0,1", "1,0", "auto", empty).  The first
+ * entry is the primary/graph device.  Returns the number of devices. */
+static int cuda_multigpu_device_list(int *out, int max_out) {
+    int available = 0;
+    if (cudaGetDeviceCount(&available) != cudaSuccess || available <= 0) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    const char *cfg = g_cuda_devices_config;
+    int n = 0;
+    if (cfg[0] == '\0') {
+        out[0] = 0;
+        return 1; /* unset: legacy single-device behavior */
+    }
+    if (!strcmp(cfg, "auto")) {
+        for (int i = 0; i < available && n < max_out; i++) out[n++] = i;
+        return n;
+    }
+    const char *p = cfg;
+    while (*p && n < max_out) {
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        if (end == p) break;
+        if (v < 0 || v >= available) {
+            fprintf(stderr, "ds4: CUDA device %ld not available (0..%d); ignoring device list\n",
+                    v, available - 1);
+            out[0] = 0;
+            return 1;
+        }
+        int dup = 0;
+        for (int i = 0; i < n; i++) dup |= out[i] == (int)v;
+        if (!dup) out[n++] = (int)v;
+        p = end;
+        while (*p == ',' || *p == ' ') p++;
+    }
+    return n > 0 ? n : 0;
+}
+
+static int cuda_peer_event_create(cudaEvent_t *ev) {
+    return cuda_ok(cudaEventCreateWithFlags(ev, cudaEventDisableTiming), "peer event create");
+}
+
+/* Initialize secondary device contexts.  The primary device is already
+ * current.  Returns 1 even when multi-GPU stays disabled: single-GPU
+ * operation must never fail because of multi-GPU configuration. */
+static int cuda_multigpu_init(const int *devices, int n_devices) {
+    if (g_cuda_multigpu_ready) return 1;
+    if (n_devices < 2) return 1;
+    if (g_cuda_split_mode == DS4_CUDA_SPLIT_OFF && !g_cuda_split_configured) {
+        /* Devices listed but no split requested: default to expert split. */
+        g_cuda_split_mode = DS4_CUDA_SPLIT_EXPERTS;
+    }
+    if (g_cuda_split_mode == DS4_CUDA_SPLIT_OFF) return 1;
+
+    g_peer_count = 0;
+    for (int i = 1; i < n_devices && g_peer_count < DS4_CUDA_MAX_DEVICES; i++) {
+        cuda_peer_device *pd = &g_peer[g_peer_count];
+        memset(pd, 0, sizeof(*pd));
+        pd->bank.slot_of.clear();
+        pd->cuda_id = devices[i];
+        if (!cuda_ok(cudaSetDevice(pd->cuda_id), "peer set device")) return 0;
+        if (!cuda_ok(cudaStreamCreate(&pd->xfer_in), "peer xfer_in create") ||
+            !cuda_ok(cudaStreamCreate(&pd->xfer_out), "peer xfer_out create") ||
+            !cuda_peer_event_create(&pd->ev_in) ||
+            !cuda_peer_event_create(&pd->ev_out)) {
+            return 0;
+        }
+        int can_fwd = 0;
+        int can_rev = 0;
+        (void)cudaDeviceCanAccessPeer(&can_fwd, pd->cuda_id, g_cuda_primary_device);
+        (void)cudaDeviceCanAccessPeer(&can_rev, g_cuda_primary_device, pd->cuda_id);
+        int p2p = 0;
+        if (g_cuda_p2p_mode >= 0 && can_fwd && can_rev) {
+            cudaError_t e1 = cudaDeviceEnablePeerAccess(g_cuda_primary_device, 0);
+            if (e1 == cudaErrorPeerAccessAlreadyEnabled) e1 = cudaSuccess;
+            (void)cudaSetDevice(g_cuda_primary_device);
+            cudaError_t e2 = cudaDeviceEnablePeerAccess(pd->cuda_id, 0);
+            if (e2 == cudaErrorPeerAccessAlreadyEnabled) e2 = cudaSuccess;
+            (void)cudaSetDevice(pd->cuda_id);
+            p2p = e1 == cudaSuccess && e2 == cudaSuccess;
+            (void)cudaGetLastError();
+        }
+        cudaDeviceProp prop;
+        memset(&prop, 0, sizeof(prop));
+        (void)cudaGetDeviceProperties(&prop, pd->cuda_id);
+        size_t free_b = 0;
+        size_t total_b = 0;
+        (void)cudaMemGetInfo(&free_b, &total_b);
+        fprintf(stderr,
+                "ds4: CUDA secondary device %d: %s, sm_%d%d, %.1f GiB free of %.1f GiB, peer access %s\n",
+                pd->cuda_id, prop.name, prop.major, prop.minor,
+                (double)free_b / 1073741824.0,
+                (double)total_b / 1073741824.0,
+                p2p ? "enabled" : "disabled (pinned-host staging)");
+        if (g_cuda_p2p_mode > 0 && !p2p) {
+            fprintf(stderr, "ds4: CUDA peer access requested but unavailable between device %d and %d\n",
+                    pd->cuda_id, g_cuda_primary_device);
+        }
+        g_peer_count++;
+    }
+    if (!cuda_ok(cudaSetDevice(g_cuda_primary_device), "primary set device")) return 0;
+    if (g_peer_count == 0) return 1;
+    if (!cuda_ok(cudaStreamCreateWithFlags(&g_peer_primary_xfer, cudaStreamNonBlocking),
+                 "primary xfer stream create") ||
+        !cuda_peer_event_create(&g_peer_primary_ev) ||
+        !cuda_peer_event_create(&g_peer_primary_add_ev)) {
+        return 0;
+    }
+    for (int i = 0; i < g_peer_count; i++) {
+        if (!cuda_peer_event_create(&g_peer[i].ev_gather)) return 0;
+    }
+    g_cuda_multigpu_ready = 1;
+    fprintf(stderr,
+            "ds4: CUDA multi-device backend enabled: primary device %d + %d secondary (split mode: experts)\n",
+            g_cuda_primary_device, g_peer_count);
+    return 1;
+}
+
+static int cuda_pinned_ensure(void **buf, uint64_t *have, uint64_t need, const char *what) {
+    if (*have >= need) return 1;
+    if (*buf) {
+        (void)cudaFreeHost(*buf);
+        *buf = NULL;
+        *have = 0;
+    }
+    void *p = NULL;
+    if (!cuda_ok(cudaHostAlloc(&p, (size_t)need, cudaHostAllocDefault), what)) return 0;
+    *buf = p;
+    *have = need;
+    return 1;
+}
+
+/* Grow-on-demand device tensor for peer scratch.  The owning device must be
+ * current. */
+static int cuda_peer_tensor_ensure(ds4_gpu_tensor *t, uint64_t need, const char *what) {
+    if (t->bytes >= need && t->ptr) return 1;
+    if (t->ptr) {
+        (void)cudaFree(t->ptr);
+        t->ptr = NULL;
+        t->bytes = 0;
+    }
+    void *p = NULL;
+    cudaError_t err = cudaMalloc(&p, (size_t)need);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA peer scratch alloc failed for %s (%.2f MiB): %s\n",
+                what, (double)need / 1048576.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    t->ptr = p;
+    t->bytes = need;
+    t->owner = 1;
+    return 1;
+}
+
+static void cuda_pin_ring_release(cuda_pin_ring *r) {
+    for (int i = 0; i < r->nslots; i++) {
+        if (r->ev_valid[i]) {
+            (void)cudaEventSynchronize(r->ev[i]);
+            (void)cudaEventDestroy(r->ev[i]);
+            r->ev_valid[i] = 0;
+        }
+    }
+    if (r->base) (void)cudaFreeHost(r->base);
+    memset(r, 0, sizeof(*r));
+}
+
+static int cuda_pin_ring_prepare(cuda_pin_ring *r, uint64_t seg) {
+    if (r->base && r->seg >= seg) return 1;
+    cuda_pin_ring_release(r);
+    const int nslots = 6;
+    void *base = NULL;
+    if (!cuda_ok(cudaHostAlloc(&base, (size_t)(seg * nslots), cudaHostAllocDefault),
+                 "bank staging ring alloc")) {
+        return 0;
+    }
+    r->base = (char *)base;
+    r->seg = seg;
+    r->nslots = nslots;
+    r->next = 0;
+    for (int i = 0; i < nslots; i++) {
+        if (!cuda_peer_event_create(&r->ev[i])) {
+            cuda_pin_ring_release(r);
+            return 0;
+        }
+        r->ev_valid[i] = 0;
+    }
+    /* Mark events created but never recorded. */
+    for (int i = 0; i < nslots; i++) r->ev_valid[i] = -1;
+    return 1;
+}
+
+/* Stage one contiguous span into the bank through the pinned ring.  The
+ * H2D copy is asynchronous on the secondary's blocking transfer stream, so
+ * later kernel launches on that device are ordered after it for free. */
+static int cuda_peer_bank_copy_seg(cuda_peer_device *pd,
+                                   char *dst,
+                                   const char *src,
+                                   uint64_t bytes) {
+    cuda_pin_ring *r = &pd->ring;
+    if (!r->base || r->seg < bytes) return 0;
+    const int i = r->next;
+    r->next = (r->next + 1) % r->nslots;
+    if (r->ev_valid[i] > 0) {
+        if (!cuda_ok(cudaEventSynchronize(r->ev[i]), "bank ring reuse sync")) return 0;
+    }
+    char *pin = r->base + (uint64_t)i * r->seg;
+    memcpy(pin, src, bytes);
+    if (!cuda_ok(cudaMemcpyAsync(dst, pin, bytes, cudaMemcpyHostToDevice, pd->xfer_in),
+                 "bank expert upload")) {
+        return 0;
+    }
+    if (!cuda_ok(cudaEventRecord(r->ev[i], pd->xfer_in), "bank ring event record")) return 0;
+    r->ev_valid[i] = 1;
+    return 1;
+}
+
+static cuda_peer_bank *cuda_peer_bank_prepare(cuda_peer_device *pd,
+                                              uint64_t gate_expert_bytes,
+                                              uint64_t down_expert_bytes,
+                                              uint32_t n_total_expert) {
+    cuda_peer_bank *b = &pd->bank;
+    if (b->valid) {
+        if (b->gate_expert_bytes != gate_expert_bytes ||
+            b->down_expert_bytes != down_expert_bytes ||
+            b->n_total_expert != n_total_expert) {
+            return NULL;
+        }
+        return b;
+    }
+    if (gate_expert_bytes == 0 || down_expert_bytes == 0 || n_total_expert == 0) return NULL;
+    int prev = 0;
+    (void)cudaGetDevice(&prev);
+    if (!cuda_ok(cudaSetDevice(pd->cuda_id), "bank set device")) return NULL;
+    uint64_t budget = g_peer_bank_budget_bytes;
+    if (budget == 0) {
+        size_t free_b = 0;
+        size_t total_b = 0;
+        (void)cudaMemGetInfo(&free_b, &total_b);
+        /* Keep room for the peer MoE scratch (gate/up/mid/down/out/xq for a
+         * full prefill chunk) plus allocator slack. */
+        const uint64_t reserve = 2560ull * 1024 * 1024;
+        budget = (uint64_t)free_b > reserve ? (uint64_t)free_b - reserve : 0;
+    }
+    const uint64_t per_expert = gate_expert_bytes * 2u + down_expert_bytes;
+    uint64_t cap64 = per_expert ? budget / per_expert : 0;
+    const uint64_t max_slots = (uint64_t)DS4_CUDA_BANK_MAX_LAYERS * n_total_expert;
+    if (cap64 > max_slots) cap64 = max_slots;
+    uint32_t cap = (uint32_t)cap64;
+    char *gate_ptr = NULL;
+    char *up_ptr = NULL;
+    char *down_ptr = NULL;
+    while (cap >= 64) {
+        gate_ptr = up_ptr = down_ptr = NULL;
+        if (cudaMalloc((void **)&gate_ptr, (size_t)(cap * gate_expert_bytes)) == cudaSuccess &&
+            cudaMalloc((void **)&up_ptr, (size_t)(cap * gate_expert_bytes)) == cudaSuccess &&
+            cudaMalloc((void **)&down_ptr, (size_t)(cap * down_expert_bytes)) == cudaSuccess) {
+            break;
+        }
+        (void)cudaGetLastError();
+        if (gate_ptr) (void)cudaFree(gate_ptr);
+        if (up_ptr) (void)cudaFree(up_ptr);
+        if (down_ptr) (void)cudaFree(down_ptr);
+        gate_ptr = up_ptr = down_ptr = NULL;
+        cap = cap / 8u * 7u;
+    }
+    if (!gate_ptr || !up_ptr || !down_ptr || cap < 64) {
+        fprintf(stderr, "ds4: CUDA device %d expert bank allocation failed\n", pd->cuda_id);
+        (void)cudaSetDevice(prev);
+        return NULL;
+    }
+    if (!cuda_pin_ring_prepare(&pd->ring,
+                               gate_expert_bytes > down_expert_bytes ? gate_expert_bytes
+                                                                     : down_expert_bytes)) {
+        (void)cudaFree(gate_ptr);
+        (void)cudaFree(up_ptr);
+        (void)cudaFree(down_ptr);
+        (void)cudaSetDevice(prev);
+        return NULL;
+    }
+    try {
+        b->slot_of.assign((size_t)DS4_CUDA_BANK_MAX_LAYERS * n_total_expert, -1);
+    } catch (...) {
+        (void)cudaFree(gate_ptr);
+        (void)cudaFree(up_ptr);
+        (void)cudaFree(down_ptr);
+        (void)cudaSetDevice(prev);
+        return NULL;
+    }
+    b->valid = 1;
+    b->capacity = cap;
+    b->count = 0;
+    b->n_total_expert = n_total_expert;
+    b->gate_expert_bytes = gate_expert_bytes;
+    b->down_expert_bytes = down_expert_bytes;
+    b->gate_ptr = gate_ptr;
+    b->up_ptr = up_ptr;
+    b->down_ptr = down_ptr;
+    fprintf(stderr,
+            "ds4: CUDA device %d expert bank: %u expert slots (%.2f GiB, %.2f MiB/expert)\n",
+            pd->cuda_id, cap,
+            (double)((uint64_t)cap * per_expert) / 1073741824.0,
+            (double)per_expert / 1048576.0);
+    (void)cudaSetDevice(prev);
+    return b;
+}
+
+static void cuda_peer_bank_release(cuda_peer_device *pd) {
+    cuda_peer_bank *b = &pd->bank;
+    if (b->gate_ptr) (void)cudaFree(b->gate_ptr);
+    if (b->up_ptr) (void)cudaFree(b->up_ptr);
+    if (b->down_ptr) (void)cudaFree(b->down_ptr);
+    b->gate_ptr = b->up_ptr = b->down_ptr = NULL;
+    b->valid = 0;
+    b->capacity = 0;
+    b->count = 0;
+    b->slot_of.clear();
+    b->slot_of.shrink_to_fit();
+}
+
+static int cuda_peer_bank_load_expert(cuda_peer_device *pd,
+                                      const ds4_gpu_stream_expert_table *t,
+                                      uint32_t expert,
+                                      uint32_t slot) {
+    cuda_peer_bank *b = &pd->bank;
+    const char *base = (const char *)t->model_map;
+    const uint64_t gate_src = t->gate_offset + (uint64_t)expert * b->gate_expert_bytes;
+    const uint64_t up_src = t->up_offset + (uint64_t)expert * b->gate_expert_bytes;
+    const uint64_t down_src = t->down_offset + (uint64_t)expert * b->down_expert_bytes;
+    if (gate_src > t->model_size || t->model_size - gate_src < b->gate_expert_bytes ||
+        up_src > t->model_size || t->model_size - up_src < b->gate_expert_bytes ||
+        down_src > t->model_size || t->model_size - down_src < b->down_expert_bytes) {
+        return 0;
+    }
+    return cuda_peer_bank_copy_seg(pd, b->gate_ptr + (uint64_t)slot * b->gate_expert_bytes,
+                                   base + gate_src, b->gate_expert_bytes) &&
+           cuda_peer_bank_copy_seg(pd, b->up_ptr + (uint64_t)slot * b->gate_expert_bytes,
+                                   base + up_src, b->gate_expert_bytes) &&
+           cuda_peer_bank_copy_seg(pd, b->down_ptr + (uint64_t)slot * b->down_expert_bytes,
+                                   base + down_src, b->down_expert_bytes);
+}
+
+/* Offer one expert to the banks.  Returns 1 when a bank owns it (either
+ * already resident or admitted now). */
+static int cuda_peer_bank_admit(const ds4_gpu_stream_expert_table *t, uint32_t expert) {
+    if (!cuda_multigpu_active()) return 0;
+    if (t->layer >= DS4_CUDA_BANK_MAX_LAYERS || expert >= t->n_total_expert) return 0;
+    for (int d = 0; d < g_peer_count; d++) {
+        cuda_peer_device *pd = &g_peer[d];
+        cuda_peer_bank *b = cuda_peer_bank_prepare(pd,
+                                                   t->gate_expert_bytes,
+                                                   t->down_expert_bytes,
+                                                   t->n_total_expert);
+        if (!b) continue;
+        const size_t key = (size_t)t->layer * b->n_total_expert + expert;
+        if (b->slot_of[key] >= 0) return 1;
+        if (b->count >= b->capacity) continue;
+        const uint32_t slot = b->count;
+        if (!cuda_peer_bank_load_expert(pd, t, expert, slot)) return 0;
+        b->slot_of[key] = (int32_t)slot;
+        b->count++;
+        return 1;
+    }
+    return 0;
+}
+
+/* Which secondary owns (layer, expert)?  Returns the peer index and writes
+ * the bank slot, or -1. */
+static int cuda_peer_bank_owner(uint32_t layer,
+                                uint32_t expert,
+                                uint64_t gate_expert_bytes,
+                                uint64_t down_expert_bytes,
+                                int32_t *slot_out) {
+    if (layer >= DS4_CUDA_BANK_MAX_LAYERS) return -1;
+    for (int d = 0; d < g_peer_count; d++) {
+        const cuda_peer_bank *b = &g_peer[d].bank;
+        if (!b->valid ||
+            b->gate_expert_bytes != gate_expert_bytes ||
+            b->down_expert_bytes != down_expert_bytes ||
+            expert >= b->n_total_expert) {
+            continue;
+        }
+        const int32_t slot = b->slot_of[(size_t)layer * b->n_total_expert + expert];
+        if (slot >= 0) {
+            *slot_out = slot;
+            return d;
+        }
+    }
+    return -1;
+}
+
+extern "C" int ds4_gpu_cuda_multigpu_active(void) {
+    return cuda_multigpu_active();
+}
+
+extern "C" uint32_t ds4_gpu_expert_bank_free_slots(void) {
+    if (!cuda_multigpu_active()) return 0;
+    uint64_t free_slots = 0;
+    for (int d = 0; d < g_peer_count; d++) {
+        const cuda_peer_bank *b = &g_peer[d].bank;
+        if (!b->valid) continue;
+        free_slots += b->capacity - b->count;
+    }
+    return free_slots > UINT32_MAX ? UINT32_MAX : (uint32_t)free_slots;
+}
+
+/* Fill bank slots with experts of one layer that no bank owns yet, in expert
+ * id order, up to max_load.  Used after the hotlist seed to use all bank
+ * capacity even when the hotlist is shorter than the bank. */
+extern "C" int ds4_gpu_expert_bank_fill_layer(const ds4_gpu_stream_expert_table *table,
+                                              uint32_t max_load,
+                                              uint32_t *loaded_out) {
+    if (loaded_out) *loaded_out = 0;
+    if (!cuda_multigpu_active() || !table) return 1;
+    if (table->layer >= DS4_CUDA_BANK_MAX_LAYERS) return 1;
+    uint32_t loaded = 0;
+    for (uint32_t e = 0; e < table->n_total_expert && loaded < max_load; e++) {
+        int32_t slot = -1;
+        if (cuda_peer_bank_owner(table->layer, e,
+                                 table->gate_expert_bytes,
+                                 table->down_expert_bytes, &slot) >= 0) {
+            continue;
+        }
+        if (ds4_gpu_expert_bank_free_slots() == 0) break;
+        if (!cuda_peer_bank_admit(table, e)) break;
+        loaded++;
+    }
+    if (loaded_out) *loaded_out = loaded;
+    return 1;
+}
+
+static void cuda_multigpu_cleanup(void) {
+    if (g_peer_count == 0 && !g_cuda_multigpu_ready) return;
+    int prev = 0;
+    (void)cudaGetDevice(&prev);
+    for (int d = 0; d < g_peer_count; d++) {
+        cuda_peer_device *pd = &g_peer[d];
+        (void)cudaSetDevice(pd->cuda_id);
+        (void)cudaDeviceSynchronize();
+        cuda_pin_ring_release(&pd->ring);
+        cuda_peer_bank_release(pd);
+        ds4_gpu_tensor *scratch[] = {&pd->gate, &pd->up, &pd->mid, &pd->down,
+                                     &pd->out, &pd->xq, &pd->sel, &pd->w_raw, &pd->w};
+        for (size_t i = 0; i < sizeof(scratch) / sizeof(scratch[0]); i++) {
+            if (scratch[i]->ptr) (void)cudaFree(scratch[i]->ptr);
+            scratch[i]->ptr = NULL;
+            scratch[i]->bytes = 0;
+        }
+        if (pd->tmp) (void)cudaFree(pd->tmp);
+        pd->tmp = NULL;
+        pd->tmp_bytes = 0;
+        if (g_cuda_tmp_peer[d]) (void)cudaFree(g_cuda_tmp_peer[d]);
+        g_cuda_tmp_peer[d] = NULL;
+        g_cuda_tmp_peer_bytes[d] = 0;
+        if (pd->xfer_in) (void)cudaStreamDestroy(pd->xfer_in);
+        if (pd->xfer_out) (void)cudaStreamDestroy(pd->xfer_out);
+        if (pd->ev_in) (void)cudaEventDestroy(pd->ev_in);
+        if (pd->ev_out) (void)cudaEventDestroy(pd->ev_out);
+        if (pd->ev_gather) (void)cudaEventDestroy(pd->ev_gather);
+        pd->xfer_in = pd->xfer_out = NULL;
+        pd->ev_in = pd->ev_out = pd->ev_gather = NULL;
+    }
+    (void)cudaSetDevice(prev);
+    if (g_peer_primary_xfer) (void)cudaStreamDestroy(g_peer_primary_xfer);
+    g_peer_primary_xfer = NULL;
+    if (g_peer_primary_ev) (void)cudaEventDestroy(g_peer_primary_ev);
+    g_peer_primary_ev = NULL;
+    if (g_peer_primary_add_ev) (void)cudaEventDestroy(g_peer_primary_add_ev);
+    g_peer_primary_add_ev = NULL;
+    void **pins[] = {&g_peer_pin_xq, &g_peer_pin_w, &g_peer_pin_sel, &g_peer_pin_out};
+    uint64_t *pin_bytes[] = {&g_peer_pin_xq_bytes, &g_peer_pin_w_bytes,
+                             &g_peer_pin_sel_bytes, &g_peer_pin_out_bytes};
+    for (size_t i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
+        if (*pins[i]) (void)cudaFreeHost(*pins[i]);
+        *pins[i] = NULL;
+        *pin_bytes[i] = 0;
+    }
+    ds4_gpu_tensor *prim[] = {&g_moe_xq0, &g_moe_w0, &g_moe_part0};
+    for (size_t i = 0; i < sizeof(prim) / sizeof(prim[0]); i++) {
+        if (prim[i]->ptr) (void)cudaFree(prim[i]->ptr);
+        prim[i]->ptr = NULL;
+        prim[i]->bytes = 0;
+    }
+    g_moe_split_pending.valid = 0;
+    g_peer_count = 0;
+    g_cuda_multigpu_ready = 0;
+}
+
 extern "C" int ds4_gpu_init(void) {
-    int dev = 0;
+    cuda_multigpu_parse_env();
+    int devices[DS4_CUDA_MAX_DEVICES];
+    int n_devices = cuda_multigpu_device_list(devices, DS4_CUDA_MAX_DEVICES);
+    if (n_devices <= 0) {
+        devices[0] = 0;
+        n_devices = 1;
+    }
+    int dev = devices[0];
+    g_cuda_primary_device = dev;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
         fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d)\n",
                 prop.name, prop.major, prop.minor);
+    }
+    if (!cuda_multigpu_init(devices, n_devices)) {
+        fprintf(stderr, "ds4: CUDA multi-device initialization failed; continuing on device %d only\n", dev);
+        cuda_multigpu_cleanup();
     }
     if (!g_cublas_ready) {
         if (!cublas_ok(cublasCreate(&g_cublas), "create handle")) return 0;
@@ -2274,6 +2999,7 @@ extern "C" int ds4_gpu_init(void) {
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
+    cuda_multigpu_cleanup();
     if (g_cublas_ready) {
         (void)cublasDestroy(g_cublas);
         g_cublas_ready = 0;
@@ -3114,31 +3840,47 @@ static int cuda_stream_selected_cache_begin_compact_load(
     return 1;
 }
 
-extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
+/* Shared staging entry for decode and batch: validate the selected ids,
+ * partition every (token, expert) pair by expert-bank ownership, then stage
+ * only the primary-owned experts through the compact selected cache.
+ *
+ * Bank-owned pairs get slot id -1 in the primary's compact list.  The MoE
+ * kernels clamp negative ids to 0, and the split launch gives those pairs a
+ * router weight of 0 on the primary, so they read a resident slot and
+ * contribute nothing.  The matching per-secondary slot lists are stashed in
+ * g_moe_split_pending and consumed by the next routed-MoE launch for this
+ * layer/pair count. */
+static int cuda_stream_selected_partition_and_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
-        uint32_t                           n_selected) {
-    if (!g_ssd_streaming_mode) return 1;
-    if (!table || !selected_ids || n_selected == 0) return 0;
+        uint32_t                           slot_count,
+        int                                strict_failure,
+        int                                allow_global_cache,
+        const char                        *what) {
     const void *model_map = table->model_map;
     const uint64_t model_size = table->model_size;
     const uint32_t layer = table->layer;
     const uint32_t n_total_expert = table->n_total_expert;
-    const uint64_t gate_offset = table->gate_offset;
-    const uint64_t up_offset = table->up_offset;
-    const uint64_t down_offset = table->down_offset;
     const uint64_t gate_expert_bytes = table->gate_expert_bytes;
     const uint64_t down_expert_bytes = table->down_expert_bytes;
 
+    cuda_moe_split_pending *pending = &g_moe_split_pending;
+    pending->valid = 0;
+    const int split = cuda_multigpu_active() && layer < DS4_CUDA_BANK_MAX_LAYERS;
+
     std::vector<int32_t> expert_to_slot(n_total_expert, -1);
+    std::vector<int32_t> expert_owner(n_total_expert, -1);
+    std::vector<int32_t> expert_bank_slot(n_total_expert, -1);
     std::vector<int32_t> compact_ids;
-    std::vector<int32_t> slot_ids(n_selected);
-    compact_ids.reserve(n_selected);
-    for (uint32_t i = 0; i < n_selected; i++) {
+    std::vector<int32_t> slot_ids(slot_count);
+    compact_ids.reserve(slot_count < n_total_expert ? slot_count : n_total_expert);
+
+    for (uint32_t i = 0; i < slot_count; i++) {
         const int32_t expert_i = selected_ids[i];
         if (expert_i < 0 || (uint32_t)expert_i >= n_total_expert) {
             fprintf(stderr,
-                    "ds4: CUDA streaming selected expert id %d is outside 0..%u at layer %u\n",
+                    "ds4: CUDA streaming %s expert id %d is outside 0..%u at layer %u\n",
+                    what,
                     expert_i,
                     n_total_expert,
                     layer);
@@ -3148,13 +3890,62 @@ extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
     }
     for (uint32_t e = 0; e < n_total_expert; e++) {
         if (expert_to_slot[e] != -2) continue;
+        if (split) {
+            int32_t bank_slot = -1;
+            const int owner = cuda_peer_bank_owner(layer, e,
+                                                   gate_expert_bytes,
+                                                   down_expert_bytes,
+                                                   &bank_slot);
+            if (owner >= 0) {
+                expert_owner[e] = owner;
+                expert_bank_slot[e] = bank_slot;
+                continue;
+            }
+        }
         expert_to_slot[e] = (int32_t)compact_ids.size();
         compact_ids.push_back((int32_t)e);
     }
-    for (uint32_t i = 0; i < n_selected; i++) {
-        slot_ids[i] = expert_to_slot[(uint32_t)selected_ids[i]];
+
+    uint32_t owned_pairs = 0;
+    if (split) {
+        for (int d = 0; d < g_peer_count; d++) {
+            try {
+                pending->dev_slots[d].assign(slot_count, -1);
+            } catch (...) {
+                return 0;
+            }
+            pending->dev_pairs[d] = 0;
+        }
     }
-    if (compact_ids.empty() || compact_ids.size() > UINT32_MAX) return 0;
+    for (uint32_t i = 0; i < slot_count; i++) {
+        const uint32_t eid = (uint32_t)selected_ids[i];
+        const int owner = split ? expert_owner[eid] : -1;
+        if (owner >= 0) {
+            slot_ids[i] = -1;
+            pending->dev_slots[owner][i] = expert_bank_slot[eid];
+            pending->dev_pairs[owner]++;
+            owned_pairs++;
+        } else {
+            slot_ids[i] = expert_to_slot[eid];
+        }
+    }
+    if (split && owned_pairs != 0) {
+        pending->layer = layer;
+        pending->n_pairs = slot_count;
+        pending->primary_pairs = slot_count - owned_pairs;
+        pending->valid = 1;
+    }
+
+    if (compact_ids.empty()) {
+        if (split && owned_pairs == slot_count) {
+            /* Every selected expert is bank-resident: nothing to stage on
+             * the primary.  The split launch skips the primary pass. */
+            cuda_stream_selected_cache_invalidate();
+            return 1;
+        }
+        return 0;
+    }
+    if (compact_ids.size() > UINT32_MAX) return 0;
     return cuda_stream_selected_cache_begin_compact_load(
             model_map,
             model_size,
@@ -3163,14 +3954,31 @@ extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
             slot_ids.data(),
             n_total_expert,
             (uint32_t)compact_ids.size(),
-            n_selected,
-            gate_offset,
-            up_offset,
-            down_offset,
+            slot_count,
+            table->gate_offset,
+            table->up_offset,
+            table->down_offset,
             gate_expert_bytes,
             down_expert_bytes,
-            0,
-            1);
+            strict_failure,
+            allow_global_cache);
+}
+
+extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_selected) {
+    if (!g_ssd_streaming_mode) return 1;
+    if (!table || !selected_ids || n_selected == 0 ||
+        table->n_total_expert == 0) {
+        return 0;
+    }
+    return cuda_stream_selected_partition_and_load(table,
+                                                   selected_ids,
+                                                   n_selected,
+                                                   0,
+                                                   1,
+                                                   "selected");
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
@@ -3187,60 +3995,12 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         (uint64_t)n_tokens > UINT32_MAX / (uint64_t)n_selected) {
         return 0;
     }
-    const void *model_map = table->model_map;
-    const uint64_t model_size = table->model_size;
-    const uint32_t layer = table->layer;
-    const uint32_t n_total_expert = table->n_total_expert;
-    const uint64_t gate_offset = table->gate_offset;
-    const uint64_t up_offset = table->up_offset;
-    const uint64_t down_offset = table->down_offset;
-    const uint64_t gate_expert_bytes = table->gate_expert_bytes;
-    const uint64_t down_expert_bytes = table->down_expert_bytes;
-
-    std::vector<int32_t> expert_to_slot(n_total_expert, -1);
-    std::vector<int32_t> compact_ids;
-    const uint32_t slot_count = n_tokens * n_selected;
-    std::vector<int32_t> slot_ids(slot_count);
-    compact_ids.reserve(slot_count < n_total_expert ? slot_count : n_total_expert);
-
-    for (uint32_t i = 0; i < slot_count; i++) {
-        const int32_t expert_i = selected_ids[i];
-        if (expert_i < 0 || (uint32_t)expert_i >= n_total_expert) {
-            fprintf(stderr,
-                    "ds4: CUDA streaming batch selected expert id %d is outside 0..%u at layer %u\n",
-                    expert_i,
-                    n_total_expert,
-                    layer);
-            return 0;
-        }
-        expert_to_slot[(uint32_t)expert_i] = -2;
-    }
-    for (uint32_t e = 0; e < n_total_expert; e++) {
-        if (expert_to_slot[e] != -2) continue;
-        expert_to_slot[e] = (int32_t)compact_ids.size();
-        compact_ids.push_back((int32_t)e);
-    }
-    for (uint32_t i = 0; i < slot_count; i++) {
-        slot_ids[i] = expert_to_slot[(uint32_t)selected_ids[i]];
-    }
-
-    if (compact_ids.empty() || compact_ids.size() > UINT32_MAX) return 0;
-    return cuda_stream_selected_cache_begin_compact_load(
-            model_map,
-            model_size,
-            layer,
-            compact_ids.data(),
-            slot_ids.data(),
-            n_total_expert,
-            (uint32_t)compact_ids.size(),
-            slot_count,
-            gate_offset,
-            up_offset,
-            down_offset,
-            gate_expert_bytes,
-            down_expert_bytes,
-            1,
-            0);
+    return cuda_stream_selected_partition_and_load(table,
+                                                   selected_ids,
+                                                   n_tokens * n_selected,
+                                                   1,
+                                                   0,
+                                                   "batch selected");
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
@@ -3269,6 +4029,34 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
                                                down_expert_bytes,
                                                "seed hotlist")) {
         return 0;
+    }
+
+    /* Multi-GPU: hand the hottest entries to the secondary expert banks
+     * first (static, never evicted).  Only entries no bank admitted keep
+     * seeding the primary streaming cache. */
+    std::vector<int32_t> ids_local;
+    std::vector<uint32_t> prio_local;
+    if (cuda_multigpu_active()) {
+        try {
+            ids_local.reserve(n_experts);
+            prio_local.reserve(n_experts);
+        } catch (...) {
+            return 0;
+        }
+        for (uint32_t i = 0; i < n_experts; i++) {
+            const int32_t expert = expert_ids[i];
+            if (expert >= 0 && (uint32_t)expert < n_total_expert &&
+                cuda_peer_bank_admit(table, (uint32_t)expert)) {
+                continue;
+            }
+            ids_local.push_back(expert);
+            prio_local.push_back(expert_priorities ? expert_priorities[i]
+                                                   : (n_experts - i));
+        }
+        if (ids_local.empty()) return 1;
+        expert_ids = ids_local.data();
+        expert_priorities = prio_local.data();
+        n_experts = (uint32_t)ids_local.size();
     }
 
     cuda_stream_expert_cache *cache =
@@ -12233,12 +13021,15 @@ static int routed_moe_launch(
         float clamp,
         const ds4_gpu_tensor *x,
         uint32_t layer_index,
-        uint32_t n_tokens) {
-    if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
+        uint32_t n_tokens,
+        const routed_moe_ext *ext) {
+    const int have_ext_xq = ext && ext->xq;
+    if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights ||
+        (!x && !have_ext_xq) ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
         gate_offset > model_size || up_offset > model_size || down_offset > model_size ||
-        x->bytes < (uint64_t)n_tokens * expert_in_dim * sizeof(float) ||
+        (x && x->bytes < (uint64_t)n_tokens * expert_in_dim * sizeof(float)) ||
         selected->bytes < (uint64_t)n_tokens * n_expert * sizeof(int32_t) ||
         weights->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
         gate->bytes < (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) ||
@@ -12250,15 +13041,21 @@ static int routed_moe_launch(
     }
     const int q4k_path = (gate_type == 12u && down_type == 12u);
     if (!q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
+    const int have_ext_weights = ext && ext->gate_w && ext->up_w && ext->down_w &&
+                                 ext->selected_ptr;
     const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
     const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
-    if (gate_bytes > model_size - gate_offset ||
-        gate_bytes > model_size - up_offset ||
-        down_bytes > model_size - down_offset) {
+    /* ext weights live in a device-resident bank, not inside the model map:
+     * the map bounds only apply to the mapped-tensor path. */
+    if (!have_ext_weights &&
+        (gate_bytes > model_size - gate_offset ||
+         gate_bytes > model_size - up_offset ||
+         down_bytes > model_size - down_offset)) {
         return 0;
     }
     const uint64_t required_slot_count = (uint64_t)n_tokens * n_expert;
     const int use_stream_selected_cache =
+        !have_ext_weights &&
         g_ssd_streaming_mode &&
         g_stream_selected_cache.valid &&
         g_stream_selected_cache.model_map == model_map &&
@@ -12278,14 +13075,19 @@ static int routed_moe_launch(
             required_slot_count * sizeof(int32_t);
     const ds4_gpu_tensor *selected_tensor =
         use_stream_selected_cache ? &g_stream_selected_cache.slot_selected_tensor : selected;
-    const int32_t *selected_ptr = (const int32_t *)selected_tensor->ptr;
-    const char *gate_w = use_stream_selected_cache
+    const int32_t *selected_ptr = have_ext_weights
+        ? ext->selected_ptr
+        : (const int32_t *)selected_tensor->ptr;
+    const char *gate_w = have_ext_weights ? ext->gate_w
+        : use_stream_selected_cache
         ? g_stream_selected_cache.gate_ptr
         : cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
-    const char *up_w = use_stream_selected_cache
+    const char *up_w = have_ext_weights ? ext->up_w
+        : use_stream_selected_cache
         ? g_stream_selected_cache.up_ptr
         : cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
-    const char *down_w = use_stream_selected_cache
+    const char *down_w = have_ext_weights ? ext->down_w
+        : use_stream_selected_cache
         ? g_stream_selected_cache.down_ptr
         : cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
     if (!gate_w || !up_w || !down_w) return 0;
@@ -12297,8 +13099,10 @@ static int routed_moe_launch(
     const uint64_t midq_count = (uint64_t)n_tokens * n_expert * midq_blocks;
     const uint64_t xq_bytes = xq_count * sizeof(cuda_block_q8_K);
     const uint64_t midq_bytes = midq_count * sizeof(cuda_block_q8_K);
-    if (down->bytes >= xq_bytes && gate->bytes >= midq_bytes) {
-        cuda_block_q8_K *xq = (cuda_block_q8_K *)down->ptr;
+    if ((have_ext_xq || down->bytes >= xq_bytes) && gate->bytes >= midq_bytes) {
+        cuda_block_q8_K *xq = have_ext_xq
+            ? (cuda_block_q8_K *)(uintptr_t)ext->xq
+            : (cuda_block_q8_K *)down->ptr;
         cuda_block_q8_K *midq = (cuda_block_q8_K *)gate->ptr;
         const uint32_t profile_moe = getenv("DS4_CUDA_MOE_PROFILE") != NULL;
         cudaEvent_t prof_ev[7] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL};
@@ -12368,12 +13172,15 @@ static int routed_moe_launch(
         uint32_t *tile16_starts = NULL;
         uint32_t tile_capacity = 0;
         uint32_t tile16_capacity = 0;
-        dim3 xq_grid(xq_blocks, n_tokens, 1);
-        q8_K_quantize_kernel<<<xq_grid, 256>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
-        ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
+        if (!have_ext_xq) {
+            dim3 xq_grid(xq_blocks, n_tokens, 1);
+            q8_K_quantize_kernel<<<xq_grid, 256>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
+            ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
+        }
         if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
         if (ok && use_sorted_pairs) {
             const uint32_t sort_expert_count =
+                have_ext_weights ? ext->sort_expert_count :
                 use_stream_selected_cache ? g_stream_selected_cache.compact_count :
                 n_total_expert;
             if (sort_expert_count == 0) ok = 0;
@@ -12400,8 +13207,9 @@ static int routed_moe_launch(
             const uint64_t tile16_experts_off = tile16_total_off + tile16_total_bytes;
             const uint64_t tile16_starts_off = tile16_experts_off + tile16_experts_bytes;
             const uint64_t scratch_bytes = tile16_starts_off + tile16_starts_bytes;
-            uint8_t *scratch = (uint8_t *)cuda_tmp_alloc(scratch_bytes,
-                                                         "routed_moe sorted pairs");
+            uint8_t *scratch = (uint8_t *)cuda_tmp_alloc_slot(ext ? ext->tmp_slot : 0,
+                                                              scratch_bytes,
+                                                              "routed_moe sorted pairs");
             if (!scratch) {
                 ok = 0;
             } else {
@@ -12911,6 +13719,320 @@ static int routed_moe_launch(
     return ok;
 }
 
+/* Router-weight masking for the multi-GPU expert split: a pair keeps its
+ * weight only where its (possibly remapped) slot id is valid; -1 marks a
+ * pair owned by another device. */
+__global__ static void moe_mask_weights_kernel(
+        float *out_w,
+        const float *in_w,
+        const int32_t *sel,
+        uint32_t n) {
+    uint32_t i = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= n) return;
+    out_w[i] = sel[i] < 0 ? 0.0f : in_w[i];
+}
+
+__global__ static void moe_add_inplace_kernel(
+        float *out,
+        const float *part,
+        uint64_t n) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] += part[i];
+}
+
+/* Multi-GPU routed-MoE dispatch.  Consumes the ownership partition stashed by
+ * cuda_stream_selected_partition_and_load: every secondary with owned pairs
+ * runs the same launch path against its expert bank (masked complement of the
+ * router weights), the primary runs its share, and the secondary partials are
+ * gathered through pinned memory and added into the primary's output.  Falls
+ * back to the plain single-device launch whenever the partition or the
+ * primary's staged cache does not line up. */
+static int routed_moe_launch_multi(
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *down,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint32_t gate_type,
+        uint32_t down_type,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        float clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t layer_index,
+        uint32_t n_tokens) {
+    cuda_moe_split_pending *pending = &g_moe_split_pending;
+    const uint32_t n_pairs = n_tokens * n_expert;
+    int split = cuda_multigpu_active() &&
+                pending->valid &&
+                pending->layer == layer_index &&
+                pending->n_pairs == n_pairs &&
+                x != NULL;
+    if (split) pending->valid = 0; /* consume exactly once */
+    if (split && pending->primary_pairs != 0) {
+        /* The primary's masked pass relies on the compact selected cache
+         * carrying the -1 markers for bank-owned pairs. */
+        const int cache_ok =
+            g_stream_selected_cache.valid &&
+            g_stream_selected_cache.layer == layer_index &&
+            g_stream_selected_cache.slot_count >= n_pairs &&
+            g_stream_selected_cache.slot_selected_ptr != NULL;
+        if (!cache_ok) split = 0;
+    }
+    if (!split) {
+        return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
+                                 gate_offset, up_offset, down_offset,
+                                 gate_type, down_type,
+                                 gate_expert_bytes, gate_row_bytes,
+                                 down_expert_bytes, down_row_bytes,
+                                 expert_in_dim, expert_mid_dim, out_dim,
+                                 selected, weights, n_total_expert, n_expert, clamp, x,
+                                 layer_index, n_tokens, NULL);
+    }
+
+    const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
+    const uint64_t xq_bytes = (uint64_t)n_tokens * xq_blocks * sizeof(cuda_block_q8_K);
+    const uint64_t w_bytes = (uint64_t)n_pairs * sizeof(float);
+    const uint64_t sel_bytes = (uint64_t)n_pairs * sizeof(int32_t);
+    const uint64_t out_bytes = (uint64_t)n_tokens * out_dim * sizeof(float);
+    const uint64_t pair_scratch = (uint64_t)n_pairs * expert_mid_dim * sizeof(float);
+    const uint64_t down_scratch = (uint64_t)n_pairs * out_dim * sizeof(float);
+    int ok = 1;
+
+    /* Primary-side persistent buffers. */
+    if (!cuda_peer_tensor_ensure(&g_moe_xq0, xq_bytes, "split xq") ||
+        !cuda_peer_tensor_ensure(&g_moe_w0, w_bytes, "split masked weights") ||
+        !cuda_peer_tensor_ensure(&g_moe_part0, out_bytes * (uint64_t)g_peer_count,
+                                 "split partial gather") ||
+        !cuda_pinned_ensure(&g_peer_pin_xq, &g_peer_pin_xq_bytes, xq_bytes, "split pin xq") ||
+        !cuda_pinned_ensure(&g_peer_pin_w, &g_peer_pin_w_bytes, w_bytes, "split pin w") ||
+        !cuda_pinned_ensure(&g_peer_pin_sel, &g_peer_pin_sel_bytes,
+                            sel_bytes * (uint64_t)g_peer_count, "split pin sel") ||
+        !cuda_pinned_ensure(&g_peer_pin_out, &g_peer_pin_out_bytes,
+                            out_bytes * (uint64_t)g_peer_count, "split pin out")) {
+        return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
+                                 gate_offset, up_offset, down_offset,
+                                 gate_type, down_type,
+                                 gate_expert_bytes, gate_row_bytes,
+                                 down_expert_bytes, down_row_bytes,
+                                 expert_in_dim, expert_mid_dim, out_dim,
+                                 selected, weights, n_total_expert, n_expert, clamp, x,
+                                 layer_index, n_tokens, NULL);
+    }
+
+    /* The pinned buffers are shared across layers: wait until the previous
+     * layer's asynchronous consumers are done before overwriting them. */
+    for (int d = 0; d < g_peer_count; d++) {
+        cuda_peer_device *pd = &g_peer[d];
+        if (!pd->pin_in_flight) continue;
+        (void)cudaEventSynchronize(pd->ev_in);
+        (void)cudaEventSynchronize(pd->ev_gather);
+        pd->pin_in_flight = 0;
+    }
+
+    /* Quantize the activations once on the primary and stage them (plus the
+     * unmasked router weights) to pinned memory on the transfer stream. */
+    dim3 xq_grid(xq_blocks, n_tokens, 1);
+    q8_K_quantize_kernel<<<xq_grid, 256>>>((cuda_block_q8_K *)g_moe_xq0.ptr,
+                                           (const float *)x->ptr,
+                                           expert_in_dim, n_tokens);
+    ok = cuda_ok(cudaGetLastError(), "split x quantize launch");
+    if (ok) ok = cuda_ok(cudaEventRecord(g_peer_primary_ev, cudaStreamLegacy),
+                         "split xq event record");
+    if (ok) ok = cuda_ok(cudaStreamWaitEvent(g_peer_primary_xfer, g_peer_primary_ev, 0),
+                         "split xfer wait xq");
+    if (ok) ok = cuda_ok(cudaMemcpyAsync(g_peer_pin_xq, g_moe_xq0.ptr, xq_bytes,
+                                         cudaMemcpyDeviceToHost, g_peer_primary_xfer),
+                         "split xq D2H");
+    if (ok) ok = cuda_ok(cudaMemcpyAsync(g_peer_pin_w, weights->ptr, w_bytes,
+                                         cudaMemcpyDeviceToHost, g_peer_primary_xfer),
+                         "split w D2H");
+    if (ok) ok = cuda_ok(cudaEventRecord(g_peer_primary_ev, g_peer_primary_xfer),
+                         "split pin-ready record");
+
+    int used[DS4_CUDA_MAX_DEVICES] = {0};
+    for (int d = 0; ok && d < g_peer_count; d++) {
+        cuda_peer_device *pd = &g_peer[d];
+        if (pending->dev_pairs[d] == 0) continue;
+        const cuda_peer_bank *bank = &pd->bank;
+        if (!bank->valid) continue;
+        char *pin_sel_d = (char *)g_peer_pin_sel + (uint64_t)d * sel_bytes;
+        char *pin_out_d = (char *)g_peer_pin_out + (uint64_t)d * out_bytes;
+        memcpy(pin_sel_d, pending->dev_slots[d].data(), sel_bytes);
+        if (!cuda_ok(cudaSetDevice(pd->cuda_id), "split peer set device")) {
+            ok = 0;
+            break;
+        }
+        if (!cuda_peer_tensor_ensure(&pd->gate, pair_scratch, "peer gate scratch") ||
+            !cuda_peer_tensor_ensure(&pd->up, pair_scratch, "peer up scratch") ||
+            !cuda_peer_tensor_ensure(&pd->mid, pair_scratch, "peer mid scratch") ||
+            !cuda_peer_tensor_ensure(&pd->down, down_scratch, "peer down scratch") ||
+            !cuda_peer_tensor_ensure(&pd->out, out_bytes, "peer out") ||
+            !cuda_peer_tensor_ensure(&pd->xq, xq_bytes, "peer xq") ||
+            !cuda_peer_tensor_ensure(&pd->sel, sel_bytes, "peer selected") ||
+            !cuda_peer_tensor_ensure(&pd->w_raw, w_bytes, "peer raw weights") ||
+            !cuda_peer_tensor_ensure(&pd->w, w_bytes, "peer masked weights")) {
+            ok = 0;
+            break;
+        }
+        /* H2D copies on the blocking transfer stream; kernel launches on this
+         * device's legacy stream are implicitly ordered after them. */
+        ok = cuda_ok(cudaStreamWaitEvent(pd->xfer_in, g_peer_primary_ev, 0),
+                     "split peer wait pins") &&
+             cuda_ok(cudaMemcpyAsync(pd->xq.ptr, g_peer_pin_xq, xq_bytes,
+                                     cudaMemcpyHostToDevice, pd->xfer_in),
+                     "split peer xq H2D") &&
+             cuda_ok(cudaMemcpyAsync(pd->w_raw.ptr, g_peer_pin_w, w_bytes,
+                                     cudaMemcpyHostToDevice, pd->xfer_in),
+                     "split peer w H2D") &&
+             cuda_ok(cudaMemcpyAsync(pd->sel.ptr, pin_sel_d, sel_bytes,
+                                     cudaMemcpyHostToDevice, pd->xfer_in),
+                     "split peer sel H2D") &&
+             cuda_ok(cudaEventRecord(pd->ev_in, pd->xfer_in),
+                     "split peer in record");
+        if (ok) {
+            moe_mask_weights_kernel<<<(n_pairs + 255u) / 256u, 256>>>(
+                    (float *)pd->w.ptr,
+                    (const float *)pd->w_raw.ptr,
+                    (const int32_t *)pd->sel.ptr,
+                    n_pairs);
+            ok = cuda_ok(cudaGetLastError(), "split peer mask launch");
+        }
+        if (ok) {
+            routed_moe_ext extd;
+            extd.gate_w = bank->gate_ptr;
+            extd.up_w = bank->up_ptr;
+            extd.down_w = bank->down_ptr;
+            extd.selected_ptr = (const int32_t *)pd->sel.ptr;
+            extd.sort_expert_count = bank->capacity;
+            extd.xq = pd->xq.ptr;
+            extd.tmp_slot = d + 1;
+            ok = routed_moe_launch(&pd->out, &pd->gate, &pd->up, &pd->mid, &pd->down,
+                                   model_map, model_size,
+                                   gate_offset, up_offset, down_offset,
+                                   gate_type, down_type,
+                                   gate_expert_bytes, gate_row_bytes,
+                                   down_expert_bytes, down_row_bytes,
+                                   expert_in_dim, expert_mid_dim, out_dim,
+                                   &pd->sel, &pd->w,
+                                   /* compact id domain: the bank capacity */
+                                   bank->capacity, n_expert, clamp,
+                                   NULL, layer_index, n_tokens, &extd) != 0;
+        }
+        if (ok) {
+            ok = cuda_ok(cudaMemcpyAsync(pin_out_d, pd->out.ptr, out_bytes,
+                                         cudaMemcpyDeviceToHost, pd->xfer_out),
+                         "split peer partial D2H") &&
+                 cuda_ok(cudaEventRecord(pd->ev_out, pd->xfer_out),
+                         "split peer out record");
+        }
+        if (ok) {
+            used[d] = 1;
+            pd->pin_in_flight = 1;
+        }
+    }
+    if (!cuda_ok(cudaSetDevice(g_cuda_primary_device), "split primary restore")) return 0;
+    if (!ok) {
+        /* A secondary failed after the partition already excluded its pairs
+         * from the primary staging.  Recompute everything on the primary
+         * through the full-tensor path (original ids and weights). */
+        fprintf(stderr,
+                "ds4: CUDA multi-GPU expert split failed at layer %u; retrying on primary\n",
+                layer_index);
+        cuda_stream_selected_cache_invalidate();
+        return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
+                                 gate_offset, up_offset, down_offset,
+                                 gate_type, down_type,
+                                 gate_expert_bytes, gate_row_bytes,
+                                 down_expert_bytes, down_row_bytes,
+                                 expert_in_dim, expert_mid_dim, out_dim,
+                                 selected, weights, n_total_expert, n_expert, clamp, x,
+                                 layer_index, n_tokens, NULL);
+    }
+
+    /* Primary share with the complementary weight mask. */
+    if (pending->primary_pairs != 0) {
+        moe_mask_weights_kernel<<<(n_pairs + 255u) / 256u, 256>>>(
+                (float *)g_moe_w0.ptr,
+                (const float *)weights->ptr,
+                g_stream_selected_cache.slot_selected_ptr,
+                n_pairs);
+        ok = cuda_ok(cudaGetLastError(), "split primary mask launch");
+        if (ok) {
+            ds4_gpu_tensor w0t;
+            w0t.ptr = g_moe_w0.ptr;
+            w0t.bytes = g_moe_w0.bytes;
+            w0t.owner = 0;
+            routed_moe_ext ext0;
+            memset(&ext0, 0, sizeof(ext0));
+            ext0.xq = g_moe_xq0.ptr;
+            ok = routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
+                                   gate_offset, up_offset, down_offset,
+                                   gate_type, down_type,
+                                   gate_expert_bytes, gate_row_bytes,
+                                   down_expert_bytes, down_row_bytes,
+                                   expert_in_dim, expert_mid_dim, out_dim,
+                                   selected, &w0t, n_total_expert, n_expert, clamp,
+                                   x, layer_index, n_tokens, &ext0) != 0;
+        }
+    } else {
+        const uint64_t n = (uint64_t)n_tokens * out_dim;
+        zero_kernel<<<(unsigned)((n + 255u) / 256u), 256>>>((float *)out->ptr, n);
+        ok = cuda_ok(cudaGetLastError(), "split primary zero launch");
+    }
+
+    /* Gather the secondary partials and add them into the primary output. */
+    for (int d = 0; ok && d < g_peer_count; d++) {
+        cuda_peer_device *pd = &g_peer[d];
+        if (!used[d]) continue;
+        const char *pin_out_d = (const char *)g_peer_pin_out + (uint64_t)d * out_bytes;
+        char *part_d = (char *)g_moe_part0.ptr + (uint64_t)d * out_bytes;
+        ok = cuda_ok(cudaStreamWaitEvent(g_peer_primary_xfer, pd->ev_out, 0),
+                     "split gather wait partial") &&
+             cuda_ok(cudaStreamWaitEvent(g_peer_primary_xfer, g_peer_primary_add_ev, 0),
+                     "split gather wait reuse") &&
+             cuda_ok(cudaMemcpyAsync(part_d, pin_out_d, out_bytes,
+                                     cudaMemcpyHostToDevice, g_peer_primary_xfer),
+                     "split partial H2D") &&
+             cuda_ok(cudaEventRecord(pd->ev_gather, g_peer_primary_xfer),
+                     "split gather record") &&
+             cuda_ok(cudaStreamWaitEvent(cudaStreamLegacy, pd->ev_gather, 0),
+                     "split add wait gather");
+        if (ok) {
+            const uint64_t n = (uint64_t)n_tokens * out_dim;
+            moe_add_inplace_kernel<<<(unsigned)((n + 255u) / 256u), 256>>>(
+                    (float *)out->ptr, (const float *)part_d, n);
+            ok = cuda_ok(cudaGetLastError(), "split add launch");
+        }
+    }
+    if (ok) {
+        ok = cuda_ok(cudaEventRecord(g_peer_primary_add_ev, cudaStreamLegacy),
+                     "split add-done record");
+    }
+    if (!ok) {
+        fprintf(stderr,
+                "ds4: CUDA multi-GPU expert gather failed at layer %u\n",
+                layer_index);
+        return 0;
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n_selected) {
     (void)selected;
     (void)n_selected;
@@ -12918,25 +14040,25 @@ extern "C" int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected,
 }
 
 extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index) {
-    return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
-                             gate_offset, up_offset, down_offset,
-                             gate_type, down_type,
-                             gate_expert_bytes, gate_row_bytes,
-                             down_expert_bytes, down_row_bytes,
-                             expert_in_dim, expert_mid_dim, out_dim,
-                             selected, weights, n_total_expert, n_expert, clamp, x,
-                             layer_index, 1);
+    return routed_moe_launch_multi(out, gate, up, mid, down, model_map, model_size,
+                                   gate_offset, up_offset, down_offset,
+                                   gate_type, down_type,
+                                   gate_expert_bytes, gate_row_bytes,
+                                   down_expert_bytes, down_row_bytes,
+                                   expert_in_dim, expert_mid_dim, out_dim,
+                                   selected, weights, n_total_expert, n_expert, clamp, x,
+                                   layer_index, 1);
 }
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
-    return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
-                             gate_offset, up_offset, down_offset,
-                             gate_type, down_type,
-                             gate_expert_bytes, gate_row_bytes,
-                             down_expert_bytes, down_row_bytes,
-                             expert_in_dim, expert_mid_dim, out_dim,
-                             selected, weights, n_total_expert, n_expert, clamp, x,
-                             layer_index, n_tokens);
+    return routed_moe_launch_multi(out, gate, up, mid, down, model_map, model_size,
+                                   gate_offset, up_offset, down_offset,
+                                   gate_type, down_type,
+                                   gate_expert_bytes, gate_row_bytes,
+                                   down_expert_bytes, down_row_bytes,
+                                   expert_in_dim, expert_mid_dim, out_dim,
+                                   selected, weights, n_total_expert, n_expert, clamp, x,
+                                   layer_index, n_tokens);
 }
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;

@@ -22,6 +22,16 @@ typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
 
+/* Native CUDA multi-GPU expert split (no-ops on other backends).  Configure
+ * before ds4_gpu_init(); environment variables DS4_CUDA_DEVICES,
+ * DS4_CUDA_SPLIT, DS4_CUDA_P2P and DS4_CUDA_EXPERT_BANK_GB act as defaults. */
+void ds4_gpu_set_cuda_devices(const char *list);      /* "0,1" | "auto" */
+void ds4_gpu_set_cuda_split(const char *mode);        /* off|auto|experts */
+void ds4_gpu_set_cuda_p2p(const char *mode);          /* auto|on|off */
+void ds4_gpu_set_cuda_expert_bank_gb(double gb);      /* per secondary */
+int ds4_gpu_cuda_multigpu_active(void);
+uint32_t ds4_gpu_expert_bank_free_slots(void);
+
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
@@ -126,6 +136,12 @@ int ds4_gpu_stream_expert_cache_seed_experts(
         const int32_t                     *expert_ids,
         const uint32_t                    *expert_priorities,
         uint32_t                           n_experts);
+/* Multi-GPU: load experts of this layer that no expert bank owns yet, in
+ * expert-id order, up to max_load slots.  No-op when the split is off. */
+int ds4_gpu_expert_bank_fill_layer(
+        const ds4_gpu_stream_expert_table *table,
+        uint32_t                           max_load,
+        uint32_t                          *loaded_out);
 void ds4_gpu_print_memory_report(const char *label);
 
 /* =========================================================================
