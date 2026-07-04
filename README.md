@@ -284,10 +284,28 @@ make cuda CUDA_ARCH=sm_86   # RTX 3090 example
 ./ds4 -m ./ds4flash.gguf --cuda-devices 0,1 --cuda-split auto \
       --ssd-streaming-cache-experts 8GB -p "Ciao!"
 
+./ds4-max                     # optimized interactive launcher for 2x RTX 3090
+
 ./ds4-bench -m ./ds4flash.gguf --cuda-devices 0,1 --cuda-split auto \
       --prompt-file speed-bench/promessi_sposi.txt \
       --ctx-start 2048 --ctx-max 8192 --step-incr 2048 --gen-tokens 128
 ```
+
+`./ds4-max` is a convenience launcher for this fork's tested 2x RTX 3090
+profile. It starts interactive chat with GPU0 as the primary graph device and
+GPU1 as a 20GB expert bank:
+
+```sh
+./ds4-max
+DS4_MODE=think DS4_CTX=100000 ./ds4-max
+DS4_MODEL=/path/to/model.gguf DS4_CACHE_EXPERTS=8GB DS4_EXPERT_BANK=20GB ./ds4-max
+```
+
+The launcher expects `./ds4` to be built and `ds4flash.gguf` to exist in the
+repo, or `DS4_MODEL` to point at a GGUF file. At startup, a healthy multi-GPU
+run should print `CUDA secondary device`, `CUDA multi-device backend enabled`,
+and `CUDA expert bank filled`. If the secondary GPU stays at only a few hundred
+MiB in `nvidia-smi`, the expert-bank path is not active.
 
 Flags (also honored as `DS4_CUDA_DEVICES`, `DS4_CUDA_SPLIT`, `DS4_CUDA_P2P`
 and `DS4_CUDA_EXPERT_BANK_GB` environment variables for frontends without

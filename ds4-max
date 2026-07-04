@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+DS4_DIR="${DS4_DIR:-$script_dir}"
+MODEL="${DS4_MODEL:-$DS4_DIR/ds4flash.gguf}"
+CTX="${DS4_CTX:-32768}"
+CACHE_EXPERTS="${DS4_CACHE_EXPERTS:-8GB}"
+EXPERT_BANK="${DS4_EXPERT_BANK:-20GB}"
+TOKENS="${DS4_TOKENS:-1500}"
+MODE="${DS4_MODE:-nothink}"
+
+export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+
+if [ ! -x "$DS4_DIR/ds4" ]; then
+  echo "Error: DS4 binary not found at $DS4_DIR/ds4" >&2
+  echo "Build it first, for example: make cuda CUDA_ARCH=sm_86 -j\"\$(nproc)\"" >&2
+  exit 1
+fi
+
+if [ ! -r "$MODEL" ]; then
+  echo "Error: model not found at $MODEL" >&2
+  echo "Set DS4_MODEL=/path/to/model.gguf or create ds4flash.gguf in the repo." >&2
+  exit 1
+fi
+
+if pgrep -u "$USER" -x ds4 >/dev/null 2>&1 || pgrep -u "$USER" -x ds4-server >/dev/null 2>&1; then
+  echo "A ds4/ds4-server process already appears to be running for $USER." >&2
+  echo "Close it with /quit first, or stop it if it is stuck:" >&2
+  pgrep -a -u "$USER" -x ds4 || true
+  pgrep -a -u "$USER" -x ds4-server || true
+  exit 1
+fi
+
+case "$MODE" in
+  think) THINK_FLAG="--think" ;;
+  think-max) THINK_FLAG="--think-max" ;;
+  nothink) THINK_FLAG="--nothink" ;;
+  *) echo "Error: DS4_MODE must be nothink, think, or think-max" >&2; exit 1 ;;
+esac
+
+cd "$DS4_DIR"
+
+echo "Starting optimized CUDA multi-GPU DS4:"
+echo "  GPU0 primary + GPU1 expert bank"
+echo "  ctx=$CTX, cache=$CACHE_EXPERTS, bank=$EXPERT_BANK, mode=$MODE"
+echo
+
+exec ./ds4 \
+  -m "$MODEL" \
+  --cuda \
+  --cuda-devices 0,1 \
+  --cuda-split experts \
+  --cuda-expert-bank "$EXPERT_BANK" \
+  --ssd-streaming-cache-experts "$CACHE_EXPERTS" \
+  --ctx "$CTX" \
+  --tokens "$TOKENS" \
+  --power 100 \
+  "$THINK_FLAG" \
+  "$@"

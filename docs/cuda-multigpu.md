@@ -132,8 +132,8 @@ prompt: 1.43 t/s prefill, 0.68 t/s generation.
 Correctness: greedy (`--temp 0`) output is token-for-token identical between
 single-GPU and multi-GPU runs of the same prompt.
 
-Benchmark logs: `/models/ds4/logs/bench-single-gpu0-2k-8k.txt`,
-`/models/ds4/logs/bench-native-multigpu-2k-8k.txt` (machine-local, not
+Benchmark logs: `~/models/ds4/logs/bench-single-gpu0-2k-8k.txt`,
+`~/models/ds4/logs/bench-native-multigpu-2k-8k.txt` (machine-local, not
 committed).
 
 ## Known limitations
