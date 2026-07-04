@@ -109,6 +109,33 @@ parallelism are intentionally not implemented; see "Why not" above.
 - `ds4.c` — option plumbing, bank seeding alongside the hotlist seed
 - `ds4_cli.c`, `ds4_bench.c`, `ds4_server.c` — flags
 
+## Measured results (2× RTX 3090, x16 + x4, no NVLink)
+
+`ds4-bench`, DeepSeek V4 Flash IQ2XXS (~81 GiB), `promessi_sposi.txt`,
+`--ssd-streaming-cache-experts 8GB`, 64 generated tokens per point. The
+secondary bank auto-sized to 3155 expert slots (20.8 GiB); bank fill takes a
+few seconds with a warm page cache.
+
+```text
+ctx     prefill t/s          generation t/s
+        1 GPU   2 GPU        1 GPU   2 GPU
+2048    34.8    48.6 (+40%)  0.74    0.97 (+31%)
+4096    33.6    48.1 (+43%)  0.74    0.96 (+30%)
+6144    32.8    47.2 (+44%)  0.73    0.93 (+27%)
+8192    32.9    45.6 (+39%)  0.74    0.93 (+26%)
+```
+
+Short-prompt decode with a warm primary expert cache: 1.80 → 2.82 t/s
+(+57%). Original pre-patch default-mode baseline on the same machine and
+prompt: 1.43 t/s prefill, 0.68 t/s generation.
+
+Correctness: greedy (`--temp 0`) output is token-for-token identical between
+single-GPU and multi-GPU runs of the same prompt.
+
+Benchmark logs: `/models/ds4/logs/bench-single-gpu0-2k-8k.txt`,
+`/models/ds4/logs/bench-native-multigpu-2k-8k.txt` (machine-local, not
+committed).
+
 ## Known limitations
 
 - The secondary devices accelerate only the routed-expert FFN. Attention,
@@ -117,3 +144,13 @@ parallelism are intentionally not implemented; see "Why not" above.
 - Startup pays one pass to fill the banks (bounded by SSD/page-cache speed).
 - GeForce PCIe P2P is disabled by NVIDIA; transfers go through pinned host
   memory. NVLink, if present, is picked up automatically via peer access.
+- Zero-weight (masked) pairs are still computed on every device — the kernels
+  apply the router weight after the expert matmuls. Decode waste is
+  negligible (a handful of pairs); in large prefill batches each device does
+  the full pair count of MoE FLOPs, so the prefill win comes from reduced
+  staging, not reduced compute. Future work: skip zero-weight pairs when
+  building the sorted-pair buckets (needs coordinated handling in the
+  non-atomic down-gather, which reads the per-pair down buffer).
+- The primary's streaming expert LRU cache is released by every prefill
+  chunk (upstream behavior of the batch staging path), so decode right after
+  a long prefill starts cold. Future work: preserve or re-seed it.

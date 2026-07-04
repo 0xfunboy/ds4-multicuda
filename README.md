@@ -267,6 +267,59 @@ is stable, re-enable thinking with a conservative generation limit:
 The important startup line is the cache report. Start conservative, then
 increase the cache if the machine has headroom.
 
+## Native CUDA Multi-GPU (experimental)
+
+CUDA builds can use **multiple NVIDIA GPUs in one process**, without the
+distributed coordinator/worker machinery. The graph (attention, KV cache,
+router, shared experts, dense projections) runs on the first listed device;
+every other device holds a static **expert bank** — as many routed-expert
+weights as its VRAM allows, loaded once at startup — and computes the routed
+MoE FFN for the experts it owns. Per token only a few KiB of activations
+cross PCIe, so this also works on slow (x4) secondary slots, needs no SLI,
+and uses NVLink/peer access only when present (pinned-host staging otherwise).
+
+```sh
+make cuda CUDA_ARCH=sm_86   # RTX 3090 example
+
+./ds4 -m ./ds4flash.gguf --cuda-devices 0,1 --cuda-split auto \
+      --ssd-streaming-cache-experts 8GB -p "Ciao!"
+
+./ds4-bench -m ./ds4flash.gguf --cuda-devices 0,1 --cuda-split auto \
+      --prompt-file speed-bench/promessi_sposi.txt \
+      --ctx-start 2048 --ctx-max 8192 --step-incr 2048 --gen-tokens 128
+```
+
+Flags (also honored as `DS4_CUDA_DEVICES`, `DS4_CUDA_SPLIT`, `DS4_CUDA_P2P`
+and `DS4_CUDA_EXPERT_BANK_GB` environment variables for frontends without
+the options):
+
+- `--cuda-devices <list|auto>` — device list; the first is the primary/graph
+  device. Requesting 2+ devices implies `--ssd-streaming`.
+- `--cuda-split <off|auto|experts>` — split mode (auto = experts).
+- `--cuda-expert-bank <N>GB` — per-secondary bank budget (default: free VRAM
+  minus a scratch reserve).
+- `--cuda-p2p <auto|on|off>` — CUDA peer access policy.
+
+Measured on 2× RTX 3090 24 GB (primary on PCIe 4.0 x16, secondary on x4, no
+NVLink) with DeepSeek V4 Flash IQ2XXS (~81 GiB), `promessi_sposi.txt`,
+64 generated tokens per point:
+
+```text
+ctx     prefill t/s          generation t/s
+        1 GPU   2 GPU        1 GPU   2 GPU
+2048    34.8    48.6 (+40%)  0.74    0.97 (+31%)
+4096    33.6    48.1 (+43%)  0.74    0.96 (+30%)
+6144    32.8    47.2 (+44%)  0.73    0.93 (+27%)
+8192    32.9    45.6 (+39%)  0.74    0.93 (+26%)
+```
+
+Short-prompt decode with a warm expert cache improves more (1.8 → 2.8 t/s on
+this machine). Greedy output is token-identical to single-GPU. See
+`docs/cuda-multigpu.md` for the architecture, limitations and benchmark
+method. This is not VRAM pooling: two 24 GB cards do not become one 48 GB
+device; the win is resident-expert coverage plus parallel expert compute for
+MoE models larger than a single GPU's VRAM.
+
 ## Distributed Inference
 
 Distributed inference lets DwarfStar **run a model that is too large for one machine** by
