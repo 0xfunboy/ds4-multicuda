@@ -49,6 +49,10 @@ typedef struct {
     bool quality;
     bool ssd_streaming;
     bool ssd_streaming_cold;
+    const char *cuda_devices;
+    const char *cuda_split;
+    const char *cuda_p2p;
+    double cuda_expert_bank_gb;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -247,6 +251,19 @@ static bench_config parse_options(int argc, char **argv) {
             c.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
             c.ssd_streaming = true;
+        } else if (!strcmp(arg, "--cuda-devices")) {
+            c.cuda_devices = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--cuda-split")) {
+            c.cuda_split = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--cuda-p2p")) {
+            c.cuda_p2p = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--cuda-expert-bank")) {
+            uint64_t bytes = 0;
+            if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg), &bytes)) {
+                fprintf(stderr, "ds4-bench: --cuda-expert-bank must be a positive GiB value\n");
+                exit(2);
+            }
+            c.cuda_expert_bank_gb = (double)bytes / 1073741824.0;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.ssd_streaming_cold = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
@@ -522,6 +539,10 @@ int main(int argc, char **argv) {
         .quality = cfg.quality,
         .ssd_streaming = cfg.ssd_streaming,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
+        .cuda_devices = cfg.cuda_devices,
+        .cuda_split = cfg.cuda_split,
+        .cuda_p2p = cfg.cuda_p2p,
+        .cuda_expert_bank_gb = cfg.cuda_expert_bank_gb,
         .expert_profile_path = cfg.expert_profile_path,
         .distributed = cfg.dist,
     };

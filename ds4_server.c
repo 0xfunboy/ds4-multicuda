@@ -11600,6 +11600,20 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
             c.engine.ssd_streaming = true;
+        } else if (!strcmp(arg, "--cuda-devices")) {
+            c.engine.cuda_devices = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--cuda-split")) {
+            c.engine.cuda_split = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--cuda-p2p")) {
+            c.engine.cuda_p2p = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--cuda-expert-bank")) {
+            uint64_t bytes = 0;
+            if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg), &bytes)) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --cuda-expert-bank must be a positive GiB value");
+                exit(2);
+            }
+            c.engine.cuda_expert_bank_gb = (double)bytes / 1073741824.0;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.engine.ssd_streaming_cold = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
