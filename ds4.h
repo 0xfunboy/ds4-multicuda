@@ -108,6 +108,10 @@ typedef struct {
     uint64_t ssd_streaming_cache_bytes;
     uint32_t ssd_streaming_preload_experts;
     uint64_t simulate_used_memory_bytes;
+    const char *cuda_devices;     /* NULL = single device (CUDA backend) */
+    const char *cuda_split;       /* NULL/off|auto|experts */
+    const char *cuda_p2p;         /* NULL/auto|on|off */
+    double cuda_expert_bank_gb;   /* 0 = auto (free VRAM minus reserve) */
     bool warm_weights;
     bool quality;
     bool ssd_streaming;

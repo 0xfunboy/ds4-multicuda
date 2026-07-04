@@ -19862,6 +19862,57 @@ static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
         seeded_layers++;
         seeded_experts += n;
     }
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* Multi-GPU: the hotlist can be shorter than the secondary expert banks.
+     * Fill the remaining bank slots round-robin across layers so all bank
+     * VRAM contributes to decode, not just the hotlist prefix. */
+    if (ds4_gpu_cuda_multigpu_active() && ds4_gpu_expert_bank_free_slots() != 0) {
+        const double tf0 = now_sec();
+        uint32_t sweep_filled = 1;
+        uint32_t total_filled = 0;
+        uint32_t progress_next = 512;
+        while (sweep_filled != 0 && ds4_gpu_expert_bank_free_slots() != 0) {
+            sweep_filled = 0;
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                const ds4_layer_weights *layer = &weights->layer[il];
+                if (!metal_graph_decode_iq2_selected_slots_expected(g, layer)) continue;
+                const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+                const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+                if (gate_row_bytes == 0 || down_row_bytes == 0 ||
+                    layer->ffn_gate_exps->dim[1] > UINT64_MAX / gate_row_bytes ||
+                    layer->ffn_down_exps->dim[1] > UINT64_MAX / down_row_bytes) {
+                    continue;
+                }
+                const uint64_t gate_expert_bytes =
+                    layer->ffn_gate_exps->dim[1] * gate_row_bytes;
+                const uint64_t down_expert_bytes =
+                    layer->ffn_down_exps->dim[1] * down_row_bytes;
+                const ds4_gpu_stream_expert_table table =
+                    graph_stream_expert_table_make(model,
+                                                   layer,
+                                                   il,
+                                                   gate_expert_bytes,
+                                                   down_expert_bytes);
+                uint32_t filled = 0;
+                if (ds4_gpu_expert_bank_fill_layer(&table, 16, &filled) == 0) break;
+                sweep_filled += filled;
+                total_filled += filled;
+                if (total_filled >= progress_next) {
+                    fprintf(stderr,
+                            "\r\033[Kds4: CUDA expert bank fill: %u experts",
+                            total_filled);
+                    progress_next += 512;
+                }
+            }
+        }
+        if (total_filled != 0) {
+            fprintf(stderr,
+                    "\r\033[Kds4: CUDA expert bank filled %u additional experts in %.1fs\n",
+                    total_filled,
+                    now_sec() - tf0);
+        }
+    }
+#endif
     if (profile) {
         const char *source_name = NULL;
         if (from_file) {
@@ -22966,6 +23017,13 @@ static int generate_metal_graph_raw_swa(
     g.ssd_streaming_cold = ssd_streaming_cold;
     g.streaming_preload_experts = ssd_streaming_preload_experts;
     g.power_percent = power_percent > 0 ? (uint32_t)power_percent : 100u;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* Multi-GPU: fill the secondary expert banks before the first prefill. */
+    if (ds4_gpu_cuda_multigpu_active() &&
+        !metal_graph_seed_streaming_expert_cache_from_hotlist(&g, model, weights)) {
+        fprintf(stderr, "ds4: CUDA expert bank seed failed; continuing without it\n");
+    }
+#endif
     if (!metal_graph_load_directional_steering(&g,
                                                directional_steering_file,
                                                directional_steering_attn,
@@ -25550,6 +25608,17 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->backend = opt->backend;
     e->quality = opt->quality;
     e->ssd_streaming = opt->ssd_streaming;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* The CUDA expert split partitions selected experts at the streaming
+     * staging points, so a multi-GPU request implies SSD-streaming mode. */
+    if (e->backend == DS4_BACKEND_CUDA &&
+        opt->cuda_devices && opt->cuda_devices[0] &&
+        (!opt->cuda_split || strcmp(opt->cuda_split, "off") != 0) &&
+        !e->ssd_streaming) {
+        fprintf(stderr, "ds4: CUDA multi-GPU expert split enables SSD-streaming mode\n");
+        e->ssd_streaming = true;
+    }
+#endif
     e->ssd_streaming_cold = opt->ssd_streaming_cold;
     e->distributed = opt->distributed;
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
@@ -25713,6 +25782,22 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 #endif
     }
     if (graph_backend) {
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        if (e->backend == DS4_BACKEND_CUDA) {
+            if (opt->cuda_devices && opt->cuda_devices[0]) {
+                ds4_gpu_set_cuda_devices(opt->cuda_devices);
+            }
+            if (opt->cuda_split && opt->cuda_split[0]) {
+                ds4_gpu_set_cuda_split(opt->cuda_split);
+            }
+            if (opt->cuda_p2p && opt->cuda_p2p[0]) {
+                ds4_gpu_set_cuda_p2p(opt->cuda_p2p);
+            }
+            if (opt->cuda_expert_bank_gb > 0.0) {
+                ds4_gpu_set_cuda_expert_bank_gb(opt->cuda_expert_bank_gb);
+            }
+        }
+#endif
         e->metal_ready = ds4_gpu_init() != 0;
         if (!e->metal_ready) {
             fprintf(stderr, "ds4: %s backend unavailable; aborting startup\n",
@@ -26082,6 +26167,17 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->graph.ssd_streaming_cold = e->ssd_streaming_cold;
     s->graph.streaming_preload_experts = e->ssd_streaming_preload_experts;
     s->graph.power_percent = (uint32_t)e->power_percent;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* Multi-GPU: fill the secondary expert banks before the first prefill.
+     * The hotlist seed is otherwise only triggered by layer-major prefill,
+     * which short prompts never reach. */
+    if (ds4_gpu_cuda_multigpu_active() &&
+        !metal_graph_seed_streaming_expert_cache_from_hotlist(&s->graph,
+                                                              &e->model,
+                                                              &e->weights)) {
+        fprintf(stderr, "ds4: CUDA expert bank seed failed; continuing without it\n");
+    }
+#endif
     if (!metal_graph_load_directional_steering(&s->graph,
                                                e->directional_steering_file,
                                                e->directional_steering_attn_scale,
