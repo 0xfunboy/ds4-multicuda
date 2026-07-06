@@ -26,11 +26,31 @@ void ds4_gpu_cleanup(void);
  * before ds4_gpu_init(); environment variables DS4_CUDA_DEVICES,
  * DS4_CUDA_SPLIT, DS4_CUDA_P2P and DS4_CUDA_EXPERT_BANK_GB act as defaults. */
 void ds4_gpu_set_cuda_devices(const char *list);      /* "0,1" | "auto" */
-void ds4_gpu_set_cuda_split(const char *mode);        /* off|auto|experts */
+void ds4_gpu_set_cuda_split(const char *mode);        /* off|auto|experts|hybrid */
 void ds4_gpu_set_cuda_p2p(const char *mode);          /* auto|on|off */
 void ds4_gpu_set_cuda_expert_bank_gb(double gb);      /* per secondary */
+void ds4_gpu_set_cuda_hot_experts_gb(double gb);      /* hybrid: GPU hot-bank budget */
+void ds4_gpu_set_cpu_moe_layers(int n);               /* hybrid: first N MoE layers CPU-only */
+void ds4_gpu_set_cpu_moe_threads(int n);              /* hybrid: CPU MoE thread cap */
 int ds4_gpu_cuda_multigpu_active(void);
 uint32_t ds4_gpu_expert_bank_free_slots(void);
+
+/* Hybrid CPU-MoE bridge, implemented in ds4.c and called from the CUDA
+ * orchestrator: compute cold (non-bank) routed experts on the CPU from the
+ * mmap'd model.  cpu_expert[i] < 0 marks a pair handled by a GPU bank.
+ * Writes this call's CPU partial (n_tok x out_dim) into out_host.
+ * Returns 1 on success, 0 if the quant types have no CPU hybrid path. */
+int ds4_cpu_moe_compute_hybrid(
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint32_t gate_type, uint32_t down_type,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        uint32_t n_total_expert,
+        const float *x_host, const int32_t *cpu_expert, const float *weights,
+        uint32_t n_tok, uint32_t n_expert, float clamp,
+        float *out_host);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);

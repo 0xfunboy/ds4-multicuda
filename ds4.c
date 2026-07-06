@@ -45,6 +45,9 @@
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1328,42 +1331,88 @@ typedef struct {
     ds4_parallel_fn fn;
     void *ctx;
     uint64_t n_rows;
+    /* Dynamic (work-stealing) row dispatch: workers grab chunks via an atomic
+     * cursor so fast P-cores take more than slow E-cores instead of the barrier
+     * waiting on a straggler with a fixed, even slice. */
+    uint64_t next_row;
+    uint64_t chunk;
 } ds4_thread_pool;
 
 static ds4_thread_pool g_pool;
 static __thread int g_parallel_depth;
 static uint32_t g_requested_threads;
 
+/* Grab and process dynamic row chunks until the range is exhausted.  Shared by
+ * the worker threads and the main thread. */
+static void ds4_pool_drain(ds4_parallel_fn fn, void *ctx, uint64_t n_rows, uint64_t chunk) {
+    for (;;) {
+        const uint64_t start = __atomic_fetch_add(&g_pool.next_row, chunk, __ATOMIC_RELAXED);
+        if (start >= n_rows) break;
+        uint64_t end = start + chunk;
+        if (end > n_rows) end = n_rows;
+        fn(ctx, start, end);
+    }
+}
+
+/* Bounded spin before sleeping between dispatches.  The per-layer MoE fires
+ * many short parallel regions ~1-2 ms apart; if the workers sleep on the
+ * condvar in the gaps, a powersave cpufreq governor downclocks the cores to
+ * ~1 GHz and the next burst runs at a fraction of peak.  Spinning keeps the
+ * cores hot (as llama.cpp's threadpool does) so the governor holds a high
+ * clock.  After the budget expires with no work the worker sleeps, so an idle
+ * chat session does not busy-wait forever.  Tunable via DS4_POOL_SPIN. */
+/* Spin budget before a worker sleeps between dispatches.  Disabled by default:
+ * on a powersave cpufreq governor, spinning all workers during the GPU-graph
+ * gaps spreads the package power budget across every core and lowers the P-core
+ * boost, hurting more than the freq it holds.  Set DS4_POOL_SPIN>0 (and ideally
+ * a performance governor) on boxes where keeping cores hot is a net win. */
+static uint64_t g_pool_spin = 0;
+
+#if defined(__x86_64__) || defined(__i386__)
+#define DS4_CPU_PAUSE() __builtin_ia32_pause()
+#elif defined(__aarch64__) || defined(__arm__)
+#define DS4_CPU_PAUSE() __asm__ __volatile__("yield")
+#else
+#define DS4_CPU_PAUSE() ((void)0)
+#endif
+
 static void *ds4_worker_main(void *arg) {
     const uint32_t tid = (uint32_t)(uintptr_t)arg;
     uint32_t seen_generation = 0;
 
     for (;;) {
-        pthread_mutex_lock(&g_pool.mutex);
-        while (seen_generation == g_pool.generation && !g_pool.shutdown) {
-            pthread_cond_wait(&g_pool.work_cond, &g_pool.mutex);
+        int have_work = 0;
+        for (uint64_t s = 0; s < g_pool_spin; s++) {
+            if (__atomic_load_n(&g_pool.generation, __ATOMIC_ACQUIRE) != seen_generation ||
+                __atomic_load_n(&g_pool.shutdown, __ATOMIC_ACQUIRE)) {
+                have_work = 1;
+                break;
+            }
+            DS4_CPU_PAUSE();
         }
-        if (g_pool.shutdown) {
+        if (!have_work) {
+            pthread_mutex_lock(&g_pool.mutex);
+            while (seen_generation == g_pool.generation && !g_pool.shutdown) {
+                pthread_cond_wait(&g_pool.work_cond, &g_pool.mutex);
+            }
             pthread_mutex_unlock(&g_pool.mutex);
+        }
+        if (__atomic_load_n(&g_pool.shutdown, __ATOMIC_ACQUIRE)) {
             return NULL;
         }
 
+        pthread_mutex_lock(&g_pool.mutex);
         seen_generation = g_pool.generation;
         ds4_parallel_fn fn = g_pool.fn;
         void *ctx = g_pool.ctx;
         const uint64_t n_rows = g_pool.n_rows;
-        const uint32_t n_threads = g_pool.n_threads;
+        const uint64_t chunk = g_pool.chunk;
         pthread_mutex_unlock(&g_pool.mutex);
+        (void)tid;
 
-        const uint64_t rows_per_thread = (n_rows + n_threads - 1) / n_threads;
-        const uint64_t row0 = (uint64_t)tid * rows_per_thread;
-        uint64_t row1 = row0 + rows_per_thread;
-        if (row1 > n_rows) row1 = n_rows;
-        if (row0 < row1) {
-            g_parallel_depth++;
-            fn(ctx, row0, row1);
-            g_parallel_depth--;
-        }
+        g_parallel_depth++;
+        ds4_pool_drain(fn, ctx, n_rows, chunk);
+        g_parallel_depth--;
 
         pthread_mutex_lock(&g_pool.mutex);
         g_pool.done++;
@@ -1396,6 +1445,13 @@ static void ds4_threads_init(void) {
     if (n_threads > DS4_MAX_THREADS) n_threads = DS4_MAX_THREADS;
     if (n_threads == 0) n_threads = 1;
 
+    const char *spin_env = getenv("DS4_POOL_SPIN");
+    if (spin_env && spin_env[0]) {
+        char *end = NULL;
+        unsigned long long v = strtoull(spin_env, &end, 10);
+        if (end != spin_env) g_pool_spin = (uint64_t)v;
+    }
+
     pthread_mutex_init(&g_pool.mutex, NULL);
     pthread_cond_init(&g_pool.work_cond, NULL);
     pthread_cond_init(&g_pool.done_cond, NULL);
@@ -1417,8 +1473,8 @@ static void ds4_threads_shutdown(void) {
     if (!g_pool.initialized) return;
 
     pthread_mutex_lock(&g_pool.mutex);
-    g_pool.shutdown = true;
-    g_pool.generation++;
+    __atomic_store_n(&g_pool.shutdown, true, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_pool.generation, g_pool.generation + 1, __ATOMIC_RELEASE);
     pthread_cond_broadcast(&g_pool.work_cond);
     pthread_mutex_unlock(&g_pool.mutex);
 
@@ -1442,24 +1498,27 @@ static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void 
         return;
     }
 
+    /* Dynamic chunk: aim for several chunks per thread so a slow core only
+     * delays by at most one chunk, while keeping the atomic cursor traffic low.
+     * A minimum keeps SIMD kernels working on cache-friendly row runs. */
+    uint64_t chunk = n_rows / ((uint64_t)g_pool.n_threads * 8u);
+    if (chunk < 16) chunk = 16;
+    if (chunk > 512) chunk = 512;
+
     pthread_mutex_lock(&g_pool.mutex);
     g_pool.fn = fn;
     g_pool.ctx = ctx;
     g_pool.n_rows = n_rows;
+    g_pool.chunk = chunk;
+    __atomic_store_n(&g_pool.next_row, 0, __ATOMIC_RELAXED);
     g_pool.done = 0;
-    g_pool.generation++;
+    __atomic_store_n(&g_pool.generation, g_pool.generation + 1, __ATOMIC_RELEASE);
     pthread_cond_broadcast(&g_pool.work_cond);
-
-    const uint64_t rows_per_thread = (n_rows + g_pool.n_threads - 1) / g_pool.n_threads;
-    uint64_t main_row1 = rows_per_thread;
-    if (main_row1 > n_rows) main_row1 = n_rows;
     pthread_mutex_unlock(&g_pool.mutex);
 
-    if (main_row1 > 0) {
-        g_parallel_depth++;
-        fn(ctx, 0, main_row1);
-        g_parallel_depth--;
-    }
+    g_parallel_depth++;
+    ds4_pool_drain(fn, ctx, n_rows, chunk);
+    g_parallel_depth--;
 
     pthread_mutex_lock(&g_pool.mutex);
     while (g_pool.done < g_pool.n_workers) {
@@ -2621,6 +2680,29 @@ static void ds4_quantize_row_q8_K(const float *x, block_q8_K *y, int64_t k) {
     }
 }
 
+#if defined(__AVX2__)
+/* AVX2 helpers ported from ggml (blocks are byte-identical), used by the x86
+ * routed-expert dot products for the hybrid CPU-MoE backend. */
+#define DS4_MM256_SET_M128I(a, b) _mm256_insertf128_si256(_mm256_castsi128_si256(b), (a), 1)
+
+static inline float ds4_hsum_float_8(const __m256 x) {
+    __m128 r = _mm_add_ps(_mm256_castps256_ps128(x), _mm256_extractf128_ps(x, 1));
+    r = _mm_add_ps(r, _mm_movehl_ps(r, r));
+    r = _mm_add_ss(r, _mm_movehdup_ps(r));
+    return _mm_cvtss_f32(r);
+}
+
+static inline __m256i ds4_scale_shuffle_q3k(int i) {
+    static const uint8_t k_shuffle[128] = {
+         0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,   2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3,
+         4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5,   6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7,
+         8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9,  10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,
+        12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,  14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,
+    };
+    return _mm256_loadu_si256((const __m256i *)k_shuffle + i);
+}
+#endif
+
 static void ds4_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const block_q8_K *y) {
     const int nb = n / QK_K;
 
@@ -2701,6 +2783,57 @@ static void ds4_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const bl
     }
 
     *s = sum;
+#elif defined(__AVX2__) && !defined(DS4_MOE_SCALAR)
+    const __m256i m3 = _mm256_set1_epi8(3);
+    const __m128i m4 = _mm_set1_epi8(0xF);
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; ++i) {
+        const float d = y[i].d * f16_to_f32(x[i].d);
+        const float dmin = -y[i].d * f16_to_f32(x[i].dmin);
+        const uint8_t *q2 = x[i].qs;
+        const int8_t *q8 = y[i].qs;
+
+        const __m128i mins_and_scales = _mm_loadu_si128((const __m128i *)x[i].scales);
+        const __m128i scales8 = _mm_and_si128(mins_and_scales, m4);
+        const __m128i mins8 = _mm_and_si128(_mm_srli_epi16(mins_and_scales, 4), m4);
+        const __m256i mins = _mm256_cvtepi8_epi16(mins8);
+        const __m256i prod = _mm256_madd_epi16(mins, _mm256_loadu_si256((const __m256i *)y[i].bsums));
+        acc = _mm256_fmadd_ps(_mm256_broadcast_ss(&dmin), _mm256_cvtepi32_ps(prod), acc);
+
+        const __m256i all_scales = _mm256_cvtepi8_epi16(scales8);
+        const __m128i l_scales = _mm256_extracti128_si256(all_scales, 0);
+        const __m128i h_scales = _mm256_extracti128_si256(all_scales, 1);
+        const __m256i scales[2] = {DS4_MM256_SET_M128I(l_scales, l_scales),
+                                   DS4_MM256_SET_M128I(h_scales, h_scales)};
+
+        __m256i sumi = _mm256_setzero_si256();
+        for (int j = 0; j < QK_K / 128; ++j) {
+            const __m256i q2bits = _mm256_loadu_si256((const __m256i *)q2); q2 += 32;
+            const __m256i q8_0 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q8_3 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q2_0 = _mm256_and_si256(q2bits, m3);
+            const __m256i q2_1 = _mm256_and_si256(_mm256_srli_epi16(q2bits, 2), m3);
+            const __m256i q2_2 = _mm256_and_si256(_mm256_srli_epi16(q2bits, 4), m3);
+            const __m256i q2_3 = _mm256_and_si256(_mm256_srli_epi16(q2bits, 6), m3);
+            __m256i p0 = _mm256_maddubs_epi16(q2_0, q8_0);
+            __m256i p1 = _mm256_maddubs_epi16(q2_1, q8_1);
+            __m256i p2 = _mm256_maddubs_epi16(q2_2, q8_2);
+            __m256i p3 = _mm256_maddubs_epi16(q2_3, q8_3);
+            p0 = _mm256_madd_epi16(_mm256_shuffle_epi8(scales[j], ds4_scale_shuffle_q3k(0)), p0);
+            p1 = _mm256_madd_epi16(_mm256_shuffle_epi8(scales[j], ds4_scale_shuffle_q3k(1)), p1);
+            p2 = _mm256_madd_epi16(_mm256_shuffle_epi8(scales[j], ds4_scale_shuffle_q3k(2)), p2);
+            p3 = _mm256_madd_epi16(_mm256_shuffle_epi8(scales[j], ds4_scale_shuffle_q3k(3)), p3);
+            p0 = _mm256_add_epi32(p0, p1);
+            p2 = _mm256_add_epi32(p2, p3);
+            sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p0, p2));
+        }
+        acc = _mm256_fmadd_ps(_mm256_broadcast_ss(&d), _mm256_cvtepi32_ps(sumi), acc);
+    }
+
+    *s = ds4_hsum_float_8(acc);
 #else
     float sumf = 0.0f;
 
@@ -2899,6 +3032,52 @@ static DS4_MAYBE_UNUSED void ds4_vec_dot_iq2_xxs_q8_K(int n, float *s, const blo
     }
 
     *s = 0.25f * sumf;
+#elif defined(__AVX2__) && !defined(DS4_MOE_SCALAR)
+    /* x86 AVX2 (ggml-style): the base grid (2 KiB) and the packed sign table
+     * (1 KiB, iq2xxs_signs reinterpreted as uint64 rows of +-1) both fit in L1,
+     * so we apply the sign to the activations and dot against the unsigned grid
+     * magnitudes.  This avoids the 256 KiB precomputed signed grid whose random
+     * access thrashes L2.  Two 32-value sub-blocks per iteration. */
+    const uint64_t *signs64 = (const uint64_t *)iq2xxs_signs;
+    __m256 accumf = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const float d = f16_to_f32(x[i].d) * y[i].d;
+        const uint16_t *q2 = x[i].qs;
+        const int8_t *q8 = y[i].qs;
+        __m256i sumi1 = _mm256_setzero_si256();
+        __m256i sumi2 = _mm256_setzero_si256();
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            uint32_t aux32[4];
+            memcpy(aux32, q2, 4 * sizeof(uint32_t));
+            q2 += 8;
+            const uint8_t *aux8 = (const uint8_t *)aux32;
+            const __m256i q2_1 = _mm256_set_epi64x(
+                (int64_t)iq2xxs_grid[aux8[3]], (int64_t)iq2xxs_grid[aux8[2]],
+                (int64_t)iq2xxs_grid[aux8[1]], (int64_t)iq2xxs_grid[aux8[0]]);
+            const __m256i q2_2 = _mm256_set_epi64x(
+                (int64_t)iq2xxs_grid[aux8[11]], (int64_t)iq2xxs_grid[aux8[10]],
+                (int64_t)iq2xxs_grid[aux8[9]],  (int64_t)iq2xxs_grid[aux8[8]]);
+            const __m256i s2_1 = _mm256_set_epi64x(
+                (int64_t)signs64[(aux32[1] >> 21) & 127], (int64_t)signs64[(aux32[1] >> 14) & 127],
+                (int64_t)signs64[(aux32[1] >>  7) & 127], (int64_t)signs64[(aux32[1] >>  0) & 127]);
+            const __m256i s2_2 = _mm256_set_epi64x(
+                (int64_t)signs64[(aux32[3] >> 21) & 127], (int64_t)signs64[(aux32[3] >> 14) & 127],
+                (int64_t)signs64[(aux32[3] >>  7) & 127], (int64_t)signs64[(aux32[3] >>  0) & 127]);
+            const __m256i q8s_1 = _mm256_sign_epi8(q8_1, s2_1);
+            const __m256i q8s_2 = _mm256_sign_epi8(q8_2, s2_2);
+            const __m256i dot1 = _mm256_maddubs_epi16(q2_1, q8s_1);
+            const __m256i dot2 = _mm256_maddubs_epi16(q2_2, q8s_2);
+            const uint16_t ls1 = aux32[1] >> 28;
+            const uint16_t ls2 = aux32[3] >> 28;
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(dot1, _mm256_set1_epi16(2 * ls1 + 1)));
+            sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(dot2, _mm256_set1_epi16(2 * ls2 + 1)));
+        }
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d),
+                                 _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf);
+    }
+    *s = 0.125f * ds4_hsum_float_8(accumf);
 #else
     uint32_t aux32[2];
     const uint8_t *aux8 = (const uint8_t *)aux32;
@@ -3007,6 +3186,53 @@ static void ds4_vec_dot_iq2_xxs_pair_q8_K(
 
     *s0 = 0.25f * total0;
     *s1 = 0.25f * total1;
+#elif defined(__AVX2__) && !defined(DS4_MOE_SCALAR)
+    /* Fused gate/up over a shared activation: load q8 once, apply each weight
+     * row's signs, dot against the L1-resident grid magnitudes. */
+    const int nb = n / QK_K;
+    const uint64_t *signs64 = (const uint64_t *)iq2xxs_signs;
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const float d0 = f16_to_f32(x0[i].d) * y[i].d;
+        const float d1 = f16_to_f32(x1[i].d) * y[i].d;
+        const uint16_t *q2a = x0[i].qs;
+        const uint16_t *q2b = x1[i].qs;
+        const int8_t *q8 = y[i].qs;
+        __m256i sum0 = _mm256_setzero_si256();
+        __m256i sum1 = _mm256_setzero_si256();
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8);
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)(q8 + 32));
+            q8 += 64;
+            uint32_t a0[4], a1[4];
+            memcpy(a0, q2a, 16); q2a += 8;
+            memcpy(a1, q2b, 16); q2b += 8;
+            const uint8_t *u0 = (const uint8_t *)a0;
+            const uint8_t *u1 = (const uint8_t *)a1;
+#define DS4_IQ2_AVX2_ONE(u, a, q8lo, q8hi, sumv) do {                                              \
+                const __m256i g1 = _mm256_set_epi64x((int64_t)iq2xxs_grid[(u)[3]], (int64_t)iq2xxs_grid[(u)[2]], \
+                                                     (int64_t)iq2xxs_grid[(u)[1]], (int64_t)iq2xxs_grid[(u)[0]]); \
+                const __m256i g2 = _mm256_set_epi64x((int64_t)iq2xxs_grid[(u)[11]], (int64_t)iq2xxs_grid[(u)[10]], \
+                                                     (int64_t)iq2xxs_grid[(u)[9]],  (int64_t)iq2xxs_grid[(u)[8]]); \
+                const __m256i sg1 = _mm256_set_epi64x((int64_t)signs64[((a)[1] >> 21) & 127], (int64_t)signs64[((a)[1] >> 14) & 127], \
+                                                      (int64_t)signs64[((a)[1] >>  7) & 127], (int64_t)signs64[((a)[1] >>  0) & 127]); \
+                const __m256i sg2 = _mm256_set_epi64x((int64_t)signs64[((a)[3] >> 21) & 127], (int64_t)signs64[((a)[3] >> 14) & 127], \
+                                                      (int64_t)signs64[((a)[3] >>  7) & 127], (int64_t)signs64[((a)[3] >>  0) & 127]); \
+                const __m256i d1v = _mm256_maddubs_epi16(g1, _mm256_sign_epi8((q8lo), sg1));       \
+                const __m256i d2v = _mm256_maddubs_epi16(g2, _mm256_sign_epi8((q8hi), sg2));       \
+                (sumv) = _mm256_add_epi32((sumv), _mm256_madd_epi16(d1v, _mm256_set1_epi16(2 * ((a)[1] >> 28) + 1))); \
+                (sumv) = _mm256_add_epi32((sumv), _mm256_madd_epi16(d2v, _mm256_set1_epi16(2 * ((a)[3] >> 28) + 1))); \
+            } while (0)
+            DS4_IQ2_AVX2_ONE(u0, a0, q8_1, q8_2, sum0);
+            DS4_IQ2_AVX2_ONE(u1, a1, q8_1, q8_2, sum1);
+#undef DS4_IQ2_AVX2_ONE
+        }
+        acc0 = _mm256_fmadd_ps(_mm256_set1_ps(d0), _mm256_cvtepi32_ps(sum0), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_set1_ps(d1), _mm256_cvtepi32_ps(sum1), acc1);
+    }
+    *s0 = 0.125f * ds4_hsum_float_8(acc0);
+    *s1 = 0.125f * ds4_hsum_float_8(acc1);
 #else
     ds4_vec_dot_iq2_xxs_q8_K(n, s0, x0, y);
     ds4_vec_dot_iq2_xxs_q8_K(n, s1, x1, y);
@@ -7796,6 +8022,215 @@ static void layer_routed_moe_batch(
     free(selected);
 
     (void)il;
+}
+
+/* =========================================================================
+ * Hybrid CPU-MoE bridge for the CUDA multi-GPU backend.
+ * =========================================================================
+ *
+ * Phase 3 "hybrid" mode keeps attention/KV/router/dense/shared/output on the
+ * GPU graph and the hottest routed experts in the static CUDA expert banks,
+ * but computes the *cold* (non-bank) experts directly on the CPU from the
+ * mmap'd model instead of streaming their weights across PCIe.  This mirrors
+ * llama.cpp's --n-cpu-moe: sparse-quantized expert weights stay in host RAM
+ * and are read at ~RAM bandwidth by the CPU dot-product kernels, so per-token
+ * PCIe traffic is limited to activations and the small partial output.
+ *
+ * The function reuses the same batch workers as layer_routed_moe_batch, but
+ * builds the per-expert base pointers from the raw model offsets the CUDA
+ * graph already carries (model_map is the host mmap base; expert e of a tensor
+ * lives at base + offset + e*expert_bytes).  Only pairs with a non-negative
+ * cpu_expert id are computed; the rest were handled by a GPU bank.  The result
+ * is written (not accumulated) into out_host as this device's CPU partial,
+ * which the CUDA orchestrator then adds into the routed-MoE output on GPU0.
+ *
+ * Threading: the shared DS4 CPU pool is otherwise idle during GPU decode, so
+ * the whole pool drives the expert matvecs concurrently with the GPU banks.
+ */
+void ds4_gpu_set_cpu_moe_threads(int n) {
+    /* Grow the shared pool so hybrid decode can actually use the requested
+     * threads; the pool is otherwise idle while the GPU runs the graph. */
+    if (n > 0 && (uint32_t)n > g_requested_threads) g_requested_threads = (uint32_t)n;
+}
+
+/* Persistent scratch for the hybrid CPU-MoE compute.  The function is called
+ * once per MoE layer from the single-threaded graph driver, so grow-only
+ * static buffers avoid ~7 malloc/free per layer per token (hundreds per token)
+ * that otherwise churn the allocator on the decode hot path. */
+static struct {
+    void *pairs;       size_t pairs_cap;
+    void *pair_weight; size_t pw_cap;
+    void *pair_expert; size_t pe_cap;
+    void *pair_ids;    size_t pi_cap;
+    void *xq;          size_t xq_cap;
+    void *mid;         size_t mid_cap;
+    void *midq;        size_t midq_cap;
+} g_hybrid_scratch;
+
+static void *ds4_hybrid_scratch_ensure(void **p, size_t *cap, size_t need) {
+    if (*cap < need) {
+        free(*p);
+        *p = xmalloc(need);
+        *cap = need;
+    }
+    return *p;
+}
+
+int ds4_cpu_moe_compute_hybrid(
+        const void *model_map,
+        uint64_t    model_size,
+        uint64_t    gate_offset,
+        uint64_t    up_offset,
+        uint64_t    down_offset,
+        uint32_t    gate_type,
+        uint32_t    down_type,
+        uint64_t    gate_expert_bytes,
+        uint64_t    gate_row_bytes,
+        uint64_t    down_expert_bytes,
+        uint64_t    down_row_bytes,
+        uint32_t    expert_in_dim,
+        uint32_t    expert_mid_dim,
+        uint32_t    out_dim,
+        uint32_t    n_total_expert,
+        const float *x_host,
+        const int32_t *cpu_expert,
+        const float *weights,
+        uint32_t    n_tok,
+        uint32_t    n_expert,
+        float       clamp,
+        float       *out_host) {
+    if (!model_map || !x_host || !cpu_expert || !weights || !out_host ||
+        n_tok == 0 || n_expert == 0 || n_total_expert == 0 ||
+        n_total_expert > DS4_MAX_EXPERT ||
+        expert_in_dim % QK_K != 0 || expert_mid_dim % QK_K != 0) {
+        return 0;
+    }
+    if (gate_type != DS4_TENSOR_IQ2_XXS || down_type != DS4_TENSOR_Q2_K) {
+        /* Only the shipping Flash quant (IQ2_XXS gate/up, Q2_K down) has a CPU
+         * hybrid path for now; the caller falls back to the GPU stream path. */
+        return 0;
+    }
+    (void)model_size;
+
+    const uint64_t in_dim = expert_in_dim;
+    const uint64_t mid_dim = expert_mid_dim;   /* gate/up out, down in */
+    const uint64_t down_out_dim = out_dim;     /* == DS4_N_EMBD */
+    const uint32_t slot_count = n_tok * n_expert;
+
+    /* Compact only the CPU-owned pairs, grouped by expert like the batch path. */
+    uint32_t counts[DS4_MAX_EXPERT + 1];
+    memset(counts, 0, (size_t)(n_total_expert + 1) * sizeof(counts[0]));
+    uint32_t active_expert[DS4_MAX_EXPERT];
+    uint32_t n_active = 0;
+
+    uint32_t n_cpu_pairs = 0;
+    for (uint32_t i = 0; i < slot_count; i++) {
+        if (cpu_expert[i] >= 0) n_cpu_pairs++;
+    }
+    if (n_cpu_pairs == 0) {
+        /* Nothing for the CPU; produce a zero partial. */
+        memset(out_host, 0, (size_t)n_tok * down_out_dim * sizeof(out_host[0]));
+        return 1;
+    }
+
+    ds4_expert_pair *pairs = ds4_hybrid_scratch_ensure(&g_hybrid_scratch.pairs,
+        &g_hybrid_scratch.pairs_cap, (size_t)n_cpu_pairs * sizeof(pairs[0]));
+    float *pair_weight = ds4_hybrid_scratch_ensure(&g_hybrid_scratch.pair_weight,
+        &g_hybrid_scratch.pw_cap, (size_t)n_cpu_pairs * sizeof(pair_weight[0]));
+    uint32_t *pair_expert = ds4_hybrid_scratch_ensure(&g_hybrid_scratch.pair_expert,
+        &g_hybrid_scratch.pe_cap, (size_t)n_cpu_pairs * sizeof(pair_expert[0]));
+    uint32_t j = 0;
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t slot = 0; slot < n_expert; slot++) {
+            const uint32_t i = t * n_expert + slot;
+            const int32_t e = cpu_expert[i];
+            if (e < 0) continue;
+            if ((uint32_t)e >= n_total_expert) return 0;
+            pairs[j] = (ds4_expert_pair){ .token = t, .slot = slot };
+            pair_weight[j] = weights[i];
+            pair_expert[j] = (uint32_t)e;
+            counts[(uint32_t)e + 1]++;
+            j++;
+        }
+    }
+    for (uint32_t e = 0; e < n_total_expert; e++) {
+        counts[e + 1] += counts[e];
+        if (counts[e + 1] != counts[e]) active_expert[n_active++] = e;
+    }
+    uint32_t cursor[DS4_MAX_EXPERT];
+    memcpy(cursor, counts, (size_t)n_total_expert * sizeof(cursor[0]));
+    uint32_t *pair_ids = ds4_hybrid_scratch_ensure(&g_hybrid_scratch.pair_ids,
+        &g_hybrid_scratch.pi_cap, (size_t)n_cpu_pairs * sizeof(pair_ids[0]));
+    for (uint32_t p = 0; p < n_cpu_pairs; p++) {
+        pair_ids[cursor[pair_expert[p]]++] = p;
+    }
+
+    /* Quantize the CPU-owned tokens' activations once. */
+    const uint64_t xq_blocks = in_dim / QK_K;
+    block_q8_K *xq = ds4_hybrid_scratch_ensure(&g_hybrid_scratch.xq,
+        &g_hybrid_scratch.xq_cap, (size_t)n_tok * xq_blocks * sizeof(xq[0]));
+    for (uint32_t t = 0; t < n_tok; t++) {
+        ds4_quantize_row_q8_K(x_host + (uint64_t)t * in_dim,
+                              xq + (uint64_t)t * xq_blocks, (int64_t)in_dim);
+    }
+
+    float *mid = ds4_hybrid_scratch_ensure(&g_hybrid_scratch.mid,
+        &g_hybrid_scratch.mid_cap, (size_t)n_cpu_pairs * mid_dim * sizeof(mid[0]));
+    const uint8_t *base = (const uint8_t *)model_map;
+
+    matvec_iq2_xxs_batch_mid_ctx mid_ctx = {
+        .mid = mid,
+        .xq = xq,
+        .pairs = pairs,
+        .pair_ids = pair_ids,
+        .expert_offset = counts,
+        .active_expert = active_expert,
+        .pair_weight = pair_weight,
+        .clamp = clamp,
+        .in_dim = in_dim,
+        .out_dim = mid_dim,
+        .xq_blocks = xq_blocks,
+    };
+    for (uint32_t ai = 0; ai < n_active; ai++) {
+        const uint32_t e = active_expert[ai];
+        mid_ctx.gate_base[e] = base + gate_offset + (uint64_t)e * gate_expert_bytes;
+        mid_ctx.up_base[e]   = base + up_offset   + (uint64_t)e * gate_expert_bytes;
+        mid_ctx.gate_row_bytes[e] = gate_row_bytes;
+        mid_ctx.up_row_bytes[e]   = gate_row_bytes;
+    }
+    ds4_parallel_for((uint64_t)n_active * mid_dim, matvec_iq2_xxs_batch_mid_worker, &mid_ctx);
+
+    const uint64_t midq_blocks = mid_dim / QK_K;
+    block_q8_K *midq = ds4_hybrid_scratch_ensure(&g_hybrid_scratch.midq,
+        &g_hybrid_scratch.midq_cap, (size_t)n_cpu_pairs * midq_blocks * sizeof(midq[0]));
+    quantize_mid_pairs_ctx quant_ctx = {
+        .mid = mid,
+        .midq = midq,
+        .down_in_dim = mid_dim,
+        .down_blocks = midq_blocks,
+    };
+    ds4_parallel_for(n_cpu_pairs, quantize_mid_pairs_worker, &quant_ctx);
+
+    matvec_q2_k_batch_accum_rows_ctx down_ctx = {
+        .moe = out_host,
+        .midq = midq,
+        .pairs = pairs,
+        .pair_ids = pair_ids,
+        .expert_offset = counts,
+        .active_expert = active_expert,
+        .n_active = n_active,
+        .n_tok = n_tok,
+        .in_dim = mid_dim,
+        .out_dim = down_out_dim,
+        .midq_blocks = midq_blocks,
+    };
+    for (uint32_t ai = 0; ai < n_active; ai++) {
+        const uint32_t e = active_expert[ai];
+        down_ctx.base[e] = base + down_offset + (uint64_t)e * down_expert_bytes;
+        down_ctx.row_bytes[e] = down_row_bytes;
+    }
+    ds4_parallel_for(down_out_dim, matvec_q2_k_batch_accum_rows_worker, &down_ctx);
+    return 1;
 }
 
 static void print_vec_stats(const char *name, const float *x, uint64_t n);
@@ -25795,6 +26230,20 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             }
             if (opt->cuda_expert_bank_gb > 0.0) {
                 ds4_gpu_set_cuda_expert_bank_gb(opt->cuda_expert_bank_gb);
+            }
+            if (opt->cuda_hot_experts_gb > 0.0) {
+                ds4_gpu_set_cuda_hot_experts_gb(opt->cuda_hot_experts_gb);
+            }
+            if (opt->cpu_moe_layers > 0) {
+                ds4_gpu_set_cpu_moe_layers(opt->cpu_moe_layers);
+            }
+            if (opt->cpu_moe_threads > 0) {
+                ds4_gpu_set_cpu_moe_threads(opt->cpu_moe_threads);
+            } else if (opt->cuda_split && !strcmp(opt->cuda_split, "hybrid")) {
+                /* Hybrid decode is CPU-MoE bound: use every online core by
+                 * default so the cold-expert dot products scale. */
+                long online = sysconf(_SC_NPROCESSORS_ONLN);
+                if (online > 1) ds4_gpu_set_cpu_moe_threads((int)online);
             }
         }
 #endif
