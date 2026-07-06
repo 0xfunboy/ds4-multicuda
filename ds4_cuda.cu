@@ -2629,7 +2629,13 @@ static int cuda_multigpu_init(const int *devices, int n_devices) {
                  "primary xfer stream create") ||
         !cuda_peer_event_create(&g_peer_primary_ev) ||
         !cuda_peer_event_create(&g_peer_primary_add_ev) ||
-        !cuda_peer_event_create(&g_hybrid_xin_ev) ||
+        /* Blocking-sync: the per-layer host wait for the CPU's input
+         * activation sleeps instead of spinning, so the orchestrating core
+         * stays cool and the CPU MoE threads hold a higher boost clock on a
+         * thermally limited CPU. */
+        !cuda_ok(cudaEventCreateWithFlags(&g_hybrid_xin_ev,
+                                          cudaEventDisableTiming | cudaEventBlockingSync),
+                 "hybrid xin event create") ||
         !cuda_peer_event_create(&g_hybrid_xout_ev)) {
         return 0;
     }
