@@ -248,6 +248,9 @@ static cudaStream_t g_stream_selected_upload_stream;
 enum {
     DS4_CUDA_SPLIT_OFF = 0,
     DS4_CUDA_SPLIT_EXPERTS = 1,
+    /* Hybrid: hot experts stay in the CUDA banks, cold (non-bank) experts are
+     * computed on the CPU instead of streamed to the primary GPU. */
+    DS4_CUDA_SPLIT_HYBRID = 2,
 };
 
 struct cuda_peer_bank {
@@ -303,6 +306,12 @@ struct cuda_moe_split_pending {
     uint32_t primary_pairs;
     uint32_t dev_pairs[DS4_CUDA_MAX_DEVICES];
     std::vector<int32_t> dev_slots[DS4_CUDA_MAX_DEVICES];
+    /* Hybrid mode: cold pairs computed on the CPU.  cpu_expert[i] is the
+     * original expert id for a CPU-owned pair, or -1 (bank-owned).  The
+     * offsets/types/row bytes are supplied by the orchestrator, which already
+     * carries them, so only the ownership vector needs stashing here. */
+    uint32_t cpu_pairs;
+    std::vector<int32_t> cpu_expert;
 };
 
 /* Pre-resolved launch overrides for running the routed-MoE path on a
@@ -326,7 +335,18 @@ static uint64_t g_peer_bank_budget_bytes; /* per secondary, 0 = auto */
 static char g_cuda_devices_config[64];  /* CLI/env device list, "" = unset */
 static int g_cuda_multigpu_ready;
 static int g_cuda_multigpu_debug;
+static int g_cuda_cpu_moe_layers;       /* hybrid: first N MoE layers CPU-only */
 static cuda_moe_split_pending g_moe_split_pending;
+/* Hybrid CPU pass buffers (pinned host, primary device).  The CPU reuses the
+ * raw router weights already staged in g_peer_pin_w. */
+static void *g_hybrid_pin_x;            /* float activations for the CPU */
+static uint64_t g_hybrid_pin_x_bytes;
+static void *g_hybrid_pin_out;          /* CPU partial output */
+static uint64_t g_hybrid_pin_out_bytes;
+static ds4_gpu_tensor g_hybrid_part;    /* device copy of the CPU partial */
+static cudaEvent_t g_hybrid_xin_ev;     /* x staged to pinned host */
+static cudaEvent_t g_hybrid_xout_ev;    /* CPU partial H2D done (buffer reuse) */
+static int g_hybrid_out_in_flight;
 /* Primary-side helpers for the split path. */
 static ds4_gpu_tensor g_moe_xq0;        /* persistent q8_K activations */
 static ds4_gpu_tensor g_moe_w0;         /* masked router weights */
@@ -344,10 +364,18 @@ static uint64_t g_peer_pin_sel_bytes;
 static void *g_peer_pin_out;
 static uint64_t g_peer_pin_out_bytes;
 
+/* Bank + partition machinery is shared by experts and hybrid modes. */
 static int cuda_multigpu_active(void) {
     return g_cuda_multigpu_ready &&
            g_peer_count > 0 &&
-           g_cuda_split_mode == DS4_CUDA_SPLIT_EXPERTS;
+           (g_cuda_split_mode == DS4_CUDA_SPLIT_EXPERTS ||
+            g_cuda_split_mode == DS4_CUDA_SPLIT_HYBRID);
+}
+
+/* Hybrid mode: cold experts go to the CPU rather than the primary GPU. */
+static int cuda_hybrid_active(void) {
+    return g_cuda_multigpu_ready &&
+           g_cuda_split_mode == DS4_CUDA_SPLIT_HYBRID;
 }
 
 static int cuda_ok(cudaError_t err, const char *what);
@@ -2429,8 +2457,19 @@ extern "C" void ds4_gpu_set_cuda_devices(const char *list) {
 extern "C" void ds4_gpu_set_cuda_split(const char *mode) {
     if (!mode) return;
     if (!strcmp(mode, "off")) g_cuda_split_mode = DS4_CUDA_SPLIT_OFF;
+    else if (!strcmp(mode, "hybrid")) g_cuda_split_mode = DS4_CUDA_SPLIT_HYBRID;
     else g_cuda_split_mode = DS4_CUDA_SPLIT_EXPERTS; /* auto == experts */
     g_cuda_split_configured = 1;
+}
+
+extern "C" void ds4_gpu_set_cuda_hot_experts_gb(double gb) {
+    /* Hybrid alias for the per-secondary bank budget: the "hot experts" are
+     * exactly the ones the CUDA banks keep resident. */
+    ds4_gpu_set_cuda_expert_bank_gb(gb);
+}
+
+extern "C" void ds4_gpu_set_cpu_moe_layers(int n) {
+    if (n >= 0) g_cuda_cpu_moe_layers = n;
 }
 
 extern "C" void ds4_gpu_set_cuda_p2p(const char *mode) {
@@ -2472,6 +2511,13 @@ static void cuda_multigpu_parse_env(void) {
             if (end != env && v > 0.0) {
                 g_peer_bank_budget_bytes = (uint64_t)(v * 1073741824.0);
             }
+        }
+    }
+    if (g_cuda_cpu_moe_layers == 0) {
+        const char *env = getenv("DS4_CPU_MOE_LAYERS");
+        if (env && env[0]) {
+            int v = atoi(env);
+            if (v > 0) g_cuda_cpu_moe_layers = v;
         }
     }
     g_cuda_multigpu_debug = getenv("DS4_CUDA_MULTIGPU_DEBUG") != NULL;
@@ -2582,7 +2628,9 @@ static int cuda_multigpu_init(const int *devices, int n_devices) {
     if (!cuda_ok(cudaStreamCreateWithFlags(&g_peer_primary_xfer, cudaStreamNonBlocking),
                  "primary xfer stream create") ||
         !cuda_peer_event_create(&g_peer_primary_ev) ||
-        !cuda_peer_event_create(&g_peer_primary_add_ev)) {
+        !cuda_peer_event_create(&g_peer_primary_add_ev) ||
+        !cuda_peer_event_create(&g_hybrid_xin_ev) ||
+        !cuda_peer_event_create(&g_hybrid_xout_ev)) {
         return 0;
     }
     for (int i = 0; i < g_peer_count; i++) {
@@ -2590,8 +2638,10 @@ static int cuda_multigpu_init(const int *devices, int n_devices) {
     }
     g_cuda_multigpu_ready = 1;
     fprintf(stderr,
-            "ds4: CUDA multi-device backend enabled: primary device %d + %d secondary (split mode: experts)\n",
-            g_cuda_primary_device, g_peer_count);
+            "ds4: CUDA multi-device backend enabled: primary device %d + %d secondary (split mode: %s)\n",
+            g_cuda_primary_device, g_peer_count,
+            g_cuda_split_mode == DS4_CUDA_SPLIT_HYBRID ? "hybrid (GPU banks + CPU cold experts)"
+                                                       : "experts");
     return 1;
 }
 
@@ -2946,15 +2996,22 @@ static void cuda_multigpu_cleanup(void) {
     g_peer_primary_ev = NULL;
     if (g_peer_primary_add_ev) (void)cudaEventDestroy(g_peer_primary_add_ev);
     g_peer_primary_add_ev = NULL;
-    void **pins[] = {&g_peer_pin_xq, &g_peer_pin_w, &g_peer_pin_sel, &g_peer_pin_out};
+    if (g_hybrid_xin_ev) (void)cudaEventDestroy(g_hybrid_xin_ev);
+    g_hybrid_xin_ev = NULL;
+    if (g_hybrid_xout_ev) (void)cudaEventDestroy(g_hybrid_xout_ev);
+    g_hybrid_xout_ev = NULL;
+    g_hybrid_out_in_flight = 0;
+    void **pins[] = {&g_peer_pin_xq, &g_peer_pin_w, &g_peer_pin_sel, &g_peer_pin_out,
+                     &g_hybrid_pin_x, &g_hybrid_pin_out};
     uint64_t *pin_bytes[] = {&g_peer_pin_xq_bytes, &g_peer_pin_w_bytes,
-                             &g_peer_pin_sel_bytes, &g_peer_pin_out_bytes};
+                             &g_peer_pin_sel_bytes, &g_peer_pin_out_bytes,
+                             &g_hybrid_pin_x_bytes, &g_hybrid_pin_out_bytes};
     for (size_t i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
         if (*pins[i]) (void)cudaFreeHost(*pins[i]);
         *pins[i] = NULL;
         *pin_bytes[i] = 0;
     }
-    ds4_gpu_tensor *prim[] = {&g_moe_xq0, &g_moe_w0, &g_moe_part0};
+    ds4_gpu_tensor *prim[] = {&g_moe_xq0, &g_moe_w0, &g_moe_part0, &g_hybrid_part};
     for (size_t i = 0; i < sizeof(prim) / sizeof(prim[0]); i++) {
         if (prim[i]->ptr) (void)cudaFree(prim[i]->ptr);
         prim[i]->ptr = NULL;
@@ -3856,6 +3913,7 @@ static int cuda_stream_selected_partition_and_load(
         uint32_t                           slot_count,
         int                                strict_failure,
         int                                allow_global_cache,
+        int                                allow_cpu,
         const char                        *what) {
     const void *model_map = table->model_map;
     const uint64_t model_size = table->model_size;
@@ -3866,11 +3924,20 @@ static int cuda_stream_selected_partition_and_load(
 
     cuda_moe_split_pending *pending = &g_moe_split_pending;
     pending->valid = 0;
+    pending->cpu_pairs = 0;
     const int split = cuda_multigpu_active() && layer < DS4_CUDA_BANK_MAX_LAYERS;
+    /* Cold experts go to the CPU only for small batches (decode).  Large
+     * prefill batches are far faster streamed to the GPU, so there hybrid
+     * behaves exactly like experts mode (cold -> primary streaming cache). */
+    const int hybrid = cuda_hybrid_active() && allow_cpu && layer < DS4_CUDA_BANK_MAX_LAYERS;
+    /* --cpu-moe N forces the first N MoE layers entirely onto the CPU (skip the
+     * bank lookup), freeing bank VRAM for the remaining layers. */
+    const int force_cpu = hybrid && (int)layer < g_cuda_cpu_moe_layers;
 
     std::vector<int32_t> expert_to_slot(n_total_expert, -1);
     std::vector<int32_t> expert_owner(n_total_expert, -1);
     std::vector<int32_t> expert_bank_slot(n_total_expert, -1);
+    std::vector<uint8_t> expert_cpu(n_total_expert, 0);
     std::vector<int32_t> compact_ids;
     std::vector<int32_t> slot_ids(slot_count);
     compact_ids.reserve(slot_count < n_total_expert ? slot_count : n_total_expert);
@@ -3890,7 +3957,7 @@ static int cuda_stream_selected_partition_and_load(
     }
     for (uint32_t e = 0; e < n_total_expert; e++) {
         if (expert_to_slot[e] != -2) continue;
-        if (split) {
+        if (split && !force_cpu) {
             int32_t bank_slot = -1;
             const int owner = cuda_peer_bank_owner(layer, e,
                                                    gate_expert_bytes,
@@ -3902,11 +3969,17 @@ static int cuda_stream_selected_partition_and_load(
                 continue;
             }
         }
+        if (hybrid) {
+            /* Cold expert: computed on the CPU, never streamed to the GPU. */
+            expert_cpu[e] = 1;
+            continue;
+        }
         expert_to_slot[e] = (int32_t)compact_ids.size();
         compact_ids.push_back((int32_t)e);
     }
 
     uint32_t owned_pairs = 0;
+    uint32_t cpu_pairs = 0;
     if (split) {
         for (int d = 0; d < g_peer_count; d++) {
             try {
@@ -3917,6 +3990,13 @@ static int cuda_stream_selected_partition_and_load(
             pending->dev_pairs[d] = 0;
         }
     }
+    if (hybrid) {
+        try {
+            pending->cpu_expert.assign(slot_count, -1);
+        } catch (...) {
+            return 0;
+        }
+    }
     for (uint32_t i = 0; i < slot_count; i++) {
         const uint32_t eid = (uint32_t)selected_ids[i];
         const int owner = split ? expert_owner[eid] : -1;
@@ -3925,9 +4005,25 @@ static int cuda_stream_selected_partition_and_load(
             pending->dev_slots[owner][i] = expert_bank_slot[eid];
             pending->dev_pairs[owner]++;
             owned_pairs++;
+        } else if (hybrid && expert_cpu[eid]) {
+            slot_ids[i] = -1;
+            pending->cpu_expert[i] = (int32_t)eid;
+            cpu_pairs++;
         } else {
             slot_ids[i] = expert_to_slot[eid];
         }
+    }
+    if (hybrid) {
+        if (owned_pairs != 0 || cpu_pairs != 0) {
+            pending->layer = layer;
+            pending->n_pairs = slot_count;
+            pending->primary_pairs = 0;  /* no GPU streaming in hybrid mode */
+            pending->cpu_pairs = cpu_pairs;
+            pending->valid = 1;
+        }
+        /* Hybrid never uses the primary streaming cache. */
+        cuda_stream_selected_cache_invalidate();
+        return 1;
     }
     if (split && owned_pairs != 0) {
         pending->layer = layer;
@@ -3978,6 +4074,7 @@ extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
                                                    n_selected,
                                                    0,
                                                    1,
+                                                   1, /* decode: CPU cold experts */
                                                    "selected");
 }
 
@@ -3995,11 +4092,15 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         (uint64_t)n_tokens > UINT32_MAX / (uint64_t)n_selected) {
         return 0;
     }
+    /* Small batches (MTP/speculative) still benefit from CPU cold experts;
+     * large prefill chunks are faster streamed to the GPU. */
+    const int allow_cpu = n_tokens <= 8u;
     return cuda_stream_selected_partition_and_load(table,
                                                    selected_ids,
                                                    n_tokens * n_selected,
                                                    1,
-                                                   0,
+                                                   allow_cpu ? 1 : 0,
+                                                   allow_cpu,
                                                    "batch selected");
 }
 
@@ -13778,12 +13879,21 @@ static int routed_moe_launch_multi(
         uint32_t n_tokens) {
     cuda_moe_split_pending *pending = &g_moe_split_pending;
     const uint32_t n_pairs = n_tokens * n_expert;
+    const int hybrid = cuda_hybrid_active();
     int split = cuda_multigpu_active() &&
                 pending->valid &&
                 pending->layer == layer_index &&
                 pending->n_pairs == n_pairs &&
                 x != NULL;
     if (split) pending->valid = 0; /* consume exactly once */
+    /* Hybrid CPU compute only supports the shipping Flash quant. */
+    const int hybrid_cpu = split && hybrid && pending->cpu_pairs != 0 &&
+                           gate_type == 16u && down_type == 10u;
+    if (split && hybrid && pending->cpu_pairs != 0 && !hybrid_cpu) {
+        /* Cold experts exist but no CPU path for this quant: fall back so the
+         * single-device launch (mapped weights) still produces them. */
+        split = 0;
+    }
     if (split && pending->primary_pairs != 0) {
         /* The primary's masked pass relies on the compact selected cache
          * carrying the -1 markers for bank-owned pairs. */
@@ -13812,10 +13922,16 @@ static int routed_moe_launch_multi(
     const uint64_t out_bytes = (uint64_t)n_tokens * out_dim * sizeof(float);
     const uint64_t pair_scratch = (uint64_t)n_pairs * expert_mid_dim * sizeof(float);
     const uint64_t down_scratch = (uint64_t)n_pairs * out_dim * sizeof(float);
+    const uint64_t x_float_bytes = (uint64_t)n_tokens * expert_in_dim * sizeof(float);
     int ok = 1;
 
     /* Primary-side persistent buffers. */
-    if (!cuda_peer_tensor_ensure(&g_moe_xq0, xq_bytes, "split xq") ||
+    const int hybrid_bufs_ok = !hybrid_cpu ||
+        (cuda_peer_tensor_ensure(&g_hybrid_part, out_bytes, "hybrid cpu partial") &&
+         cuda_pinned_ensure(&g_hybrid_pin_x, &g_hybrid_pin_x_bytes, x_float_bytes, "hybrid pin x") &&
+         cuda_pinned_ensure(&g_hybrid_pin_out, &g_hybrid_pin_out_bytes, out_bytes, "hybrid pin out"));
+    if (!hybrid_bufs_ok ||
+        !cuda_peer_tensor_ensure(&g_moe_xq0, xq_bytes, "split xq") ||
         !cuda_peer_tensor_ensure(&g_moe_w0, w_bytes, "split masked weights") ||
         !cuda_peer_tensor_ensure(&g_moe_part0, out_bytes * (uint64_t)g_peer_count,
                                  "split partial gather") ||
@@ -13844,24 +13960,46 @@ static int routed_moe_launch_multi(
         (void)cudaEventSynchronize(pd->ev_gather);
         pd->pin_in_flight = 0;
     }
+    if (g_hybrid_out_in_flight) {
+        /* Previous layer's CPU partial H2D must finish before we overwrite the
+         * pinned CPU output buffer. */
+        (void)cudaEventSynchronize(g_hybrid_xout_ev);
+        g_hybrid_out_in_flight = 0;
+    }
 
-    /* Quantize the activations once on the primary and stage them (plus the
-     * unmasked router weights) to pinned memory on the transfer stream. */
-    dim3 xq_grid(xq_blocks, n_tokens, 1);
-    q8_K_quantize_kernel<<<xq_grid, 256>>>((cuda_block_q8_K *)g_moe_xq0.ptr,
-                                           (const float *)x->ptr,
-                                           expert_in_dim, n_tokens);
-    ok = cuda_ok(cudaGetLastError(), "split x quantize launch");
+    /* Stage what each consumer needs to pinned host memory.  The CPU cold pass
+     * needs the raw float activations and router weights; the GPU banks need the
+     * q8_K activations.  When no bank owns a pair this layer (hybrid all-CPU or
+     * a bank miss) the q8_K quantize and its D2H are pure overhead, so skip them
+     * to keep the host's per-layer wait on the critical path minimal. */
+    int have_bank = 0;
+    for (int d = 0; d < g_peer_count; d++) have_bank |= (pending->dev_pairs[d] != 0);
+
+    if (have_bank) {
+        dim3 xq_grid(xq_blocks, n_tokens, 1);
+        q8_K_quantize_kernel<<<xq_grid, 256>>>((cuda_block_q8_K *)g_moe_xq0.ptr,
+                                               (const float *)x->ptr,
+                                               expert_in_dim, n_tokens);
+        ok = cuda_ok(cudaGetLastError(), "split x quantize launch");
+    }
     if (ok) ok = cuda_ok(cudaEventRecord(g_peer_primary_ev, cudaStreamLegacy),
-                         "split xq event record");
+                         "split x-ready record");
     if (ok) ok = cuda_ok(cudaStreamWaitEvent(g_peer_primary_xfer, g_peer_primary_ev, 0),
-                         "split xfer wait xq");
-    if (ok) ok = cuda_ok(cudaMemcpyAsync(g_peer_pin_xq, g_moe_xq0.ptr, xq_bytes,
+                         "split xfer wait x");
+    if (have_bank && ok) ok = cuda_ok(cudaMemcpyAsync(g_peer_pin_xq, g_moe_xq0.ptr, xq_bytes,
                                          cudaMemcpyDeviceToHost, g_peer_primary_xfer),
                          "split xq D2H");
     if (ok) ok = cuda_ok(cudaMemcpyAsync(g_peer_pin_w, weights->ptr, w_bytes,
                                          cudaMemcpyDeviceToHost, g_peer_primary_xfer),
                          "split w D2H");
+    if (ok && hybrid_cpu) {
+        /* Stage the raw float activations for the CPU cold-expert pass. */
+        ok = cuda_ok(cudaMemcpyAsync(g_hybrid_pin_x, x->ptr, x_float_bytes,
+                                     cudaMemcpyDeviceToHost, g_peer_primary_xfer),
+                     "hybrid x D2H");
+        if (ok) ok = cuda_ok(cudaEventRecord(g_hybrid_xin_ev, g_peer_primary_xfer),
+                             "hybrid x-ready record");
+    }
     if (ok) ok = cuda_ok(cudaEventRecord(g_peer_primary_ev, g_peer_primary_xfer),
                          "split pin-ready record");
 
@@ -13965,6 +14103,45 @@ static int routed_moe_launch_multi(
                                  layer_index, n_tokens, NULL);
     }
 
+    /* Hybrid: compute the cold (non-bank) experts on the CPU concurrently with
+     * the GPU bank kernels that are already queued above.  The CPU reads the
+     * sparse-quantized expert weights straight from the mmap'd model at RAM
+     * bandwidth, so no expert weights cross PCIe. */
+    int cpu_ok = 0;
+    if (hybrid_cpu) {
+        /* pin_x (and pin_w, staged earlier on the same stream) must be ready. */
+        (void)cudaEventSynchronize(g_hybrid_xin_ev);
+        cpu_ok = ds4_cpu_moe_compute_hybrid(
+                     model_map, model_size,
+                     gate_offset, up_offset, down_offset,
+                     gate_type, down_type,
+                     gate_expert_bytes, gate_row_bytes,
+                     down_expert_bytes, down_row_bytes,
+                     expert_in_dim, expert_mid_dim, out_dim,
+                     n_total_expert,
+                     (const float *)g_hybrid_pin_x,
+                     pending->cpu_expert.data(),
+                     (const float *)g_peer_pin_w,
+                     n_tokens, n_expert, clamp,
+                     (float *)g_hybrid_pin_out) != 0;
+        if (!cpu_ok) {
+            fprintf(stderr, "ds4: CUDA hybrid CPU MoE failed at layer %u\n", layer_index);
+            return 0;
+        }
+        /* g_hybrid_part is a single device buffer reused every layer.  The
+         * previous layer's add (on the legacy stream) reads it; block this
+         * H2D until those adds finished, or a fast legacy stream would let the
+         * next H2D overwrite the buffer mid-read -> non-deterministic output. */
+        ok = cuda_ok(cudaStreamWaitEvent(g_peer_primary_xfer, g_peer_primary_add_ev, 0),
+                     "hybrid partial wait reuse") &&
+             cuda_ok(cudaMemcpyAsync(g_hybrid_part.ptr, g_hybrid_pin_out, out_bytes,
+                                     cudaMemcpyHostToDevice, g_peer_primary_xfer),
+                     "hybrid partial H2D") &&
+             cuda_ok(cudaEventRecord(g_hybrid_xout_ev, g_peer_primary_xfer),
+                     "hybrid partial record");
+        if (ok) g_hybrid_out_in_flight = 1;
+    }
+
     /* Primary share with the complementary weight mask. */
     if (pending->primary_pairs != 0) {
         moe_mask_weights_kernel<<<(n_pairs + 255u) / 256u, 256>>>(
@@ -13994,6 +14171,18 @@ static int routed_moe_launch_multi(
         const uint64_t n = (uint64_t)n_tokens * out_dim;
         zero_kernel<<<(unsigned)((n + 255u) / 256u), 256>>>((float *)out->ptr, n);
         ok = cuda_ok(cudaGetLastError(), "split primary zero launch");
+    }
+
+    /* Add the CPU cold-expert partial into the output. */
+    if (ok && hybrid_cpu && cpu_ok) {
+        ok = cuda_ok(cudaStreamWaitEvent(cudaStreamLegacy, g_hybrid_xout_ev, 0),
+                     "hybrid add wait partial");
+        if (ok) {
+            const uint64_t n = (uint64_t)n_tokens * out_dim;
+            moe_add_inplace_kernel<<<(unsigned)((n + 255u) / 256u), 256>>>(
+                    (float *)out->ptr, (const float *)g_hybrid_part.ptr, n);
+            ok = cuda_ok(cudaGetLastError(), "hybrid add launch");
+        }
     }
 
     /* Gather the secondary partials and add them into the primary output. */
