@@ -53,6 +53,9 @@ typedef struct {
     const char *cuda_split;
     const char *cuda_p2p;
     double cuda_expert_bank_gb;
+    double cuda_hot_experts_gb;
+    int cpu_moe_layers;
+    int cpu_moe_threads;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -264,6 +267,17 @@ static bench_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.cuda_expert_bank_gb = (double)bytes / 1073741824.0;
+        } else if (!strcmp(arg, "--cuda-hot-experts")) {
+            uint64_t bytes = 0;
+            if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg), &bytes)) {
+                fprintf(stderr, "ds4-bench: --cuda-hot-experts must be a positive GiB value\n");
+                exit(2);
+            }
+            c.cuda_hot_experts_gb = (double)bytes / 1073741824.0;
+        } else if (!strcmp(arg, "--cpu-moe")) {
+            c.cpu_moe_layers = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--cpu-moe-threads")) {
+            c.cpu_moe_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.ssd_streaming_cold = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
@@ -543,6 +557,9 @@ int main(int argc, char **argv) {
         .cuda_split = cfg.cuda_split,
         .cuda_p2p = cfg.cuda_p2p,
         .cuda_expert_bank_gb = cfg.cuda_expert_bank_gb,
+        .cuda_hot_experts_gb = cfg.cuda_hot_experts_gb,
+        .cpu_moe_layers = cfg.cpu_moe_layers,
+        .cpu_moe_threads = cfg.cpu_moe_threads,
         .expert_profile_path = cfg.expert_profile_path,
         .distributed = cfg.dist,
     };

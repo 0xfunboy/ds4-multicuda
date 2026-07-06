@@ -109,9 +109,12 @@ typedef struct {
     uint32_t ssd_streaming_preload_experts;
     uint64_t simulate_used_memory_bytes;
     const char *cuda_devices;     /* NULL = single device (CUDA backend) */
-    const char *cuda_split;       /* NULL/off|auto|experts */
+    const char *cuda_split;       /* NULL/off|auto|experts|hybrid */
     const char *cuda_p2p;         /* NULL/auto|on|off */
     double cuda_expert_bank_gb;   /* 0 = auto (free VRAM minus reserve) */
+    double cuda_hot_experts_gb;   /* hybrid: GPU hot-bank budget, 0 = auto */
+    int cpu_moe_layers;           /* hybrid: first N MoE layers CPU-only */
+    int cpu_moe_threads;          /* hybrid: CPU MoE thread count */
     bool warm_weights;
     bool quality;
     bool ssd_streaming;

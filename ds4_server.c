@@ -11614,6 +11614,18 @@ static server_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.engine.cuda_expert_bank_gb = (double)bytes / 1073741824.0;
+        } else if (!strcmp(arg, "--cuda-hot-experts")) {
+            uint64_t bytes = 0;
+            if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg), &bytes)) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --cuda-hot-experts must be a positive GiB value");
+                exit(2);
+            }
+            c.engine.cuda_hot_experts_gb = (double)bytes / 1073741824.0;
+        } else if (!strcmp(arg, "--cpu-moe")) {
+            c.engine.cpu_moe_layers = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--cpu-moe-threads")) {
+            c.engine.cpu_moe_threads = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.engine.ssd_streaming_cold = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
