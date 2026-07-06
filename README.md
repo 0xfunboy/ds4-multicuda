@@ -313,10 +313,35 @@ the options):
 
 - `--cuda-devices <list|auto>` — device list; the first is the primary/graph
   device. Requesting 2+ devices implies `--ssd-streaming`.
-- `--cuda-split <off|auto|experts>` — split mode (auto = experts).
-- `--cuda-expert-bank <N>GB` — per-secondary bank budget (default: free VRAM
-  minus a scratch reserve).
+- `--cuda-split <off|auto|experts|hybrid>` — split mode (auto = experts).
+  **`hybrid` is the fastest for a model larger than VRAM**: hot experts stay in
+  the GPU banks, cold experts are computed on the CPU (AVX2) from RAM instead of
+  streamed over PCIe. See "Hybrid CPU-MoE" below.
+- `--cuda-expert-bank <N>GB` / `--cuda-hot-experts <N>GB` — per-secondary bank
+  budget (default: free VRAM minus a scratch reserve).
+- `--cpu-moe <N>` — hybrid: force the first N MoE layers entirely onto the CPU.
+- `--cpu-moe-threads <N>` — hybrid: CPU threads for cold experts (default: all
+  online cores).
 - `--cuda-p2p <auto|on|off>` — CUDA peer access policy.
+
+### Hybrid CPU-MoE (`--cuda-split hybrid`)
+
+```sh
+./ds4 -m ./ds4flash.gguf --cuda-devices 0,1 --cuda-split hybrid \
+      --ssd-streaming-cache-experts 8GB -p "Ciao!"
+```
+
+For a MoE model too big for VRAM, `hybrid` computes the cold (non-bank) experts
+on the CPU with AVX2 kernels reading the weights straight from host RAM, so only
+activations cross PCIe. Prefill still runs on the GPU (streaming is faster for
+large batches); decode runs cold experts on the CPU. On 2× RTX 3090 + i5-13500
+with DeepSeek V4 Flash IQ2XXS this takes decode from 2.82 t/s (experts mode) to
+~6.6 t/s sustained (up to ~9.8 t/s warm), prefill ~54 t/s. Greedy output is
+deterministic and matches the scalar kernels token-for-token.
+
+**Set the CPU governor to `performance` for maximum decode**
+(`sudo cpupower frequency-set -g performance`): the per-layer MoE is bursty and
+a `powersave` governor holds the cores near ~1 GHz, roughly halving decode.
 
 Measured on 2× RTX 3090 24 GB (primary on PCIe 4.0 x16, secondary on x4, no
 NVLink) with DeepSeek V4 Flash IQ2XXS (~81 GiB), `promessi_sposi.txt`,

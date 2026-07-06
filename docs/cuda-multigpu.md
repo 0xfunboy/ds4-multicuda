@@ -3,6 +3,18 @@
 Status: experimental, Linux/CUDA only. Developed and tested on 2× RTX 3090
 (sm_86, 24 GB each) with CUDA 13.x, driver 580+.
 
+> **Phase 3 (`--cuda-split hybrid`) is the fastest mode for a model larger than
+> VRAM.** It keeps the hottest experts in the GPU banks and computes the *cold*
+> experts on the CPU (AVX2) directly from host RAM instead of streaming their
+> weights across PCIe — the same idea as llama.cpp's `--n-cpu-moe`. On 2× RTX
+> 3090 + i5-13500 it takes DeepSeek V4 Flash decode from 2.82 t/s (experts mode)
+> to ~6.6 t/s sustained (up to ~9.8 t/s when the CPU holds a high clock), while
+> prefill stays on the GPU at ~54 t/s. See "Phase 3: Hybrid CPU-MoE" below.
+>
+> **For maximum decode speed set the CPU frequency governor to `performance`**
+> (`sudo cpupower frequency-set -g performance`). DS4's per-layer MoE is bursty;
+> a `powersave` governor keeps the cores near ~1 GHz and roughly halves decode.
+
 ## Problem
 
 DS4's CUDA backend runs the whole model graph on one device. When the model is
@@ -135,6 +147,80 @@ single-GPU and multi-GPU runs of the same prompt.
 Benchmark logs: `~/models/ds4/logs/bench-single-gpu0-2k-8k.txt`,
 `~/models/ds4/logs/bench-native-multigpu-2k-8k.txt` (machine-local, not
 committed).
+
+## Phase 3: Hybrid CPU-MoE (`--cuda-split hybrid`)
+
+Phase 2 (`experts`) keeps hot experts in the GPU banks and *streams* the cold
+ones to the primary GPU over PCIe. Benchmarking against llama.cpp showed that
+computing those cold experts on the CPU (from RAM, at ~50 GB/s) beats streaming
+their weights over a PCIe link — llama.cpp's `--n-cpu-moe` reached ~9.5 t/s
+all-CPU vs DS4's ~1 t/s streamed. Hybrid mode brings that strategy into DS4.
+
+Per MoE layer the selected (token, expert) pairs are partitioned three ways:
+
+- **GPU1 bank** (hot experts resident in the secondary's VRAM) — computed on
+  GPU1, gathered as in Phase 2.
+- **CPU** (cold experts) — computed on the CPU by the DS4 quantized dot-product
+  kernels reading the expert weights straight from the mmap'd model. Only the
+  activations (D2H, a few KiB) and the partial output (H2D) cross PCIe; the
+  expert weights never do.
+- The primary GPU runs the graph and sums the partials.
+
+The CPU pass runs concurrently with the GPU1 bank kernels. Decode and small
+batches (≤8 tokens) use the CPU for cold experts; **large prefill batches stay
+on the GPU** (streaming is far faster than the CPU for 2k-token batches), so
+hybrid prefill matches experts-mode prefill.
+
+### x86 AVX2 expert kernels
+
+DS4's CPU quantized kernels previously had only an ARM NEON path (its Apple
+target) plus a scalar x86 fallback ~3× slower than llama.cpp. Phase 3 adds AVX2
+implementations of the routed-expert dot products used on the decode hot path:
+
+- `ds4_vec_dot_iq2_xxs_q8_K` and the fused gate/up pair — ggml-style, using the
+  2 KiB base grid + 1 KiB packed sign table (both L1-resident) rather than a
+  256 KiB precomputed signed grid that thrashes L2.
+- `ds4_vec_dot_q2_K_q8_K` — ported from ggml's AVX2 kernel.
+
+These are numerically equivalent to the scalar path (integer dot products are
+exact; only float accumulation order differs, so greedy output matches the
+scalar kernels token-for-token until an eventual near-tie, exactly as any two
+float implementations differ). Build a scalar-only binary for verification with
+`-DDS4_MOE_SCALAR`.
+
+### Dynamic thread scheduling
+
+The CPU pool now hands out row chunks via an atomic cursor (work-stealing)
+instead of a fixed even split. On the i5-13500's 6 P-core + 8 E-core layout the
+even split made the slow E-cores stragglers that the barrier waited on; dynamic
+chunking gave +12 % decode. This helps all CPU compute, not just MoE.
+
+### CLI
+
+```
+--cuda-split hybrid            # hot experts on GPU banks, cold experts on CPU
+--cpu-moe N                    # force the first N MoE layers entirely onto CPU
+--cpu-moe-threads N            # CPU threads for cold experts (default: all cores)
+--cuda-hot-experts NGB         # GPU hot-bank budget (alias of --cuda-expert-bank)
+```
+
+Environment: `DS4_CPU_MOE_LAYERS`, `DS4_POOL_SPIN` (worker spin budget before
+sleeping; 0 = off, the default — spinning hurt on a powersave governor here).
+
+### Measured (2× RTX 3090, i5-13500, DeepSeek V4 Flash IQ2XXS)
+
+```
+mode                         prefill t/s   decode t/s
+experts (Phase 2)               ~54          2.82
+hybrid  (Phase 3), powersave    ~54          6.6 sustained (up to ~9.8 warm)
+llama.cpp -ncmoe 31 -ts 33/10   102          11.1
+```
+
+Decode is CPU-frequency-bound: the per-layer MoE is bursty, and a `powersave`
+governor holds the cores near ~1 GHz (cool, not thermally throttled), roughly
+halving decode. With `performance` the same build is expected to land near the
+llama.cpp figure. Prefill matches experts mode because large batches stay on
+the GPU.
 
 ## Known limitations
 
